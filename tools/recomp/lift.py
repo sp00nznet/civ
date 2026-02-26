@@ -94,20 +94,26 @@ def _write(op: Operand, val: str) -> str:
             return f'mem_write16(cpu, {seg}, {off}, (uint16_t)({val}));'
     return f'/* write ??? = {val} */;'
 
-def _label(addr: int) -> str:
+def _label(addr: int, prefix: str = '') -> str:
     """Generate a label name for an address."""
-    return f'L_{addr:04X}'
+    if prefix:
+        return f'L_{prefix}_{addr:06X}'
+    return f'L_{addr:06X}'
 
 
 class Lifter:
     """Lifts x86-16 instructions to C code."""
 
-    def __init__(self):
+    def __init__(self, overlay_bases=None):
         self.output = []
         self.indent = 1
         self.labels_needed = set()
         self.func_calls = set()     # Near call targets in this function
         self.ovl_calls = set()      # Overlay call targets
+        self.func_name = ''         # Current function name (for label uniqueness)
+        self.valid_addrs = set()    # Valid instruction addresses in current function
+        # Map overlay number -> code_offset (absolute file offset of overlay code start)
+        self.overlay_bases = overlay_bases or {}
 
     def _emit(self, code: str, comment: str = ''):
         """Emit a line of C code with optional comment."""
@@ -125,7 +131,7 @@ class Lifter:
     def _emit_label(self, addr: int):
         """Emit a label if it's referenced."""
         if addr in self.labels_needed:
-            self.output.append(f'{_label(addr)}:;')
+            self.output.append(f'{_label(addr, self.func_name)}:;')
 
     def lift_instruction(self, inst: Instruction, func_start: int):
         """Lift a single instruction to C code."""
@@ -400,8 +406,11 @@ class Lifter:
         elif m == 'jmp':
             if op1 and op1.type in (OpType.REL8, OpType.REL16):
                 target = op1.disp
-                self.labels_needed.add(target)
-                self._emit(f'goto {_label(target)};', orig)
+                if target in self.valid_addrs:
+                    self.labels_needed.add(target)
+                    self._emit(f'goto {_label(target, self.func_name)};', orig)
+                else:
+                    self._emit(f'/* jmp out of function to 0x{target:06X} */', orig)
             elif op1 and op1.type == OpType.MEM:
                 self._emit(f'/* indirect jmp via {_read(op1)} - needs dispatch */', orig)
             else:
@@ -416,31 +425,46 @@ class Lifter:
                 'jl': 'cc_l', 'jge': 'cc_ge', 'jle': 'cc_le', 'jg': 'cc_g',
             }
             target = op1.disp
-            self.labels_needed.add(target)
             cc = CC_MAP[m]
-            self._emit(f'if ({cc}(cpu)) goto {_label(target)};', orig)
+            if target in self.valid_addrs:
+                self.labels_needed.add(target)
+                self._emit(f'if ({cc}(cpu)) goto {_label(target, self.func_name)};', orig)
+            else:
+                self._emit(f'/* {m} out of function to 0x{target:06X} */', orig)
 
         elif m == 'loop':
             target = op1.disp
-            self.labels_needed.add(target)
-            self._emit(f'cpu->cx--; if (cpu->cx != 0) goto {_label(target)};', orig)
+            if target in self.valid_addrs:
+                self.labels_needed.add(target)
+                self._emit(f'cpu->cx--; if (cpu->cx != 0) goto {_label(target, self.func_name)};', orig)
+            else:
+                self._emit(f'/* loop out of function to 0x{target:06X} */', orig)
 
         elif m == 'loopz':
             target = op1.disp
-            self.labels_needed.add(target)
-            self._emit(f'cpu->cx--; if (cpu->cx != 0 && zf(cpu)) '
-                       f'goto {_label(target)};', orig)
+            if target in self.valid_addrs:
+                self.labels_needed.add(target)
+                self._emit(f'cpu->cx--; if (cpu->cx != 0 && zf(cpu)) '
+                           f'goto {_label(target, self.func_name)};', orig)
+            else:
+                self._emit(f'/* loopz out of function to 0x{target:06X} */', orig)
 
         elif m == 'loopnz':
             target = op1.disp
-            self.labels_needed.add(target)
-            self._emit(f'cpu->cx--; if (cpu->cx != 0 && !zf(cpu)) '
-                       f'goto {_label(target)};', orig)
+            if target in self.valid_addrs:
+                self.labels_needed.add(target)
+                self._emit(f'cpu->cx--; if (cpu->cx != 0 && !zf(cpu)) '
+                           f'goto {_label(target, self.func_name)};', orig)
+            else:
+                self._emit(f'/* loopnz out of function to 0x{target:06X} */', orig)
 
         elif m == 'jcxz':
             target = op1.disp
-            self.labels_needed.add(target)
-            self._emit(f'if (cpu->cx == 0) goto {_label(target)};', orig)
+            if target in self.valid_addrs:
+                self.labels_needed.add(target)
+                self._emit(f'if (cpu->cx == 0) goto {_label(target, self.func_name)};', orig)
+            else:
+                self._emit(f'/* jcxz out of function to 0x{target:06X} */', orig)
 
         elif m == 'call':
             if op1 and op1.type == OpType.REL16:
@@ -471,10 +495,17 @@ class Lifter:
             int_num = op1.disp
             if int_num == 0x3F and inst.overlay_num >= 0:
                 # Overlay call - resolved to direct function call
-                func_name = f'ovl{inst.overlay_num:02d}_{inst.overlay_off:04X}'
+                # Compute absolute file offset from overlay base + relative offset
+                ovl_num = inst.overlay_num
+                ovl_off = inst.overlay_off
+                if ovl_num in self.overlay_bases:
+                    abs_addr = self.overlay_bases[ovl_num] + ovl_off
+                    func_name = f'ovl{ovl_num:02d}_{abs_addr:06X}'
+                else:
+                    func_name = f'ovl{ovl_num:02d}_{ovl_off:04X}'
                 self.ovl_calls.add(func_name)
                 self._emit(f'{func_name}(cpu);',
-                           f'INT 3Fh -> OVL {inst.overlay_num:02X}:{inst.overlay_off:04X}')
+                           f'INT 3Fh -> OVL {ovl_num:02X}:{ovl_off:04X}')
             elif int_num == 0x21:
                 self._emit(f'dos_int21(cpu);', orig)
             elif int_num == 0x10:
@@ -575,8 +606,20 @@ class Lifter:
         elif m == 'leave':
             self._emit('cpu->sp = cpu->bp; cpu->bp = pop16(cpu);', orig)
 
-        elif m in ('in', 'out'):
-            self._emit(f'/* {orig} - port I/O stub */', orig)
+        elif m == 'in':
+            if op2 and op2.type == OpType.IMM8:
+                port_expr = f'0x{op2.disp & 0xFF:02X}'
+            else:
+                port_expr = _read(op2) if op2 else 'cpu->dx'
+            self._emit(_write(op1, f'port_in8(cpu, {port_expr})'), orig)
+
+        elif m == 'out':
+            if op1 and op1.type == OpType.IMM8:
+                port_expr = f'0x{op1.disp & 0xFF:02X}'
+            else:
+                port_expr = _read(op1) if op1 else 'cpu->dx'
+            val_expr = _read(op2) if op2 else 'cpu->al'
+            self._emit(f'port_out8(cpu, {port_expr}, {val_expr});', orig)
 
         elif m == 'wait':
             self._emit('/* wait */', orig)
@@ -602,24 +645,22 @@ class Lifter:
         self.labels_needed = set()
         self.func_calls = set()
         self.ovl_calls = set()
+        self.func_name = name
         self.indent = 1
 
-        # First pass: collect jump targets for labels
+        # Build set of valid instruction addresses for this function
+        self.valid_addrs = set(inst.address for inst in instructions)
+
+        # First pass: collect jump targets for labels (only within function)
         for inst in instructions:
             m = inst.mnemonic
             if m in ('jmp', 'jo','jno','jb','jae','je','jne','jbe','ja',
                      'js','jns','jp','jnp','jl','jge','jle','jg',
                      'loop', 'loopz', 'loopnz', 'jcxz'):
                 if inst.op1 and inst.op1.type in (OpType.REL8, OpType.REL16):
-                    self.labels_needed.add(inst.op1.disp)
-
-        # Handle REP prefix wrapping
-        rep_instructions = []
-        for inst in instructions:
-            if inst.prefix in ('rep', 'repnz'):
-                rep_instructions.append(inst)
-            else:
-                rep_instructions.append(inst)
+                    target = inst.op1.disp
+                    if target in self.valid_addrs:
+                        self.labels_needed.add(target)
 
         # Second pass: generate C code
         self.output.append(f'void {name}(CPU *cpu)')
@@ -630,10 +671,11 @@ class Lifter:
                 self._emit_label(inst.address)
                 self._emit(f'while (cpu->cx != 0) {{ cpu->cx--;', f'rep {inst.mnemonic}')
                 self.indent += 1
-                # Emit the string op body
+                # Emit the string op body (set address to -1 to avoid duplicate label)
                 stripped = Instruction()
                 stripped.__dict__.update(inst.__dict__)
                 stripped.prefix = ''
+                stripped.address = -1
                 self.lift_instruction(stripped, func_start)
                 self.indent -= 1
                 self._emit('}')
@@ -644,6 +686,7 @@ class Lifter:
                 stripped = Instruction()
                 stripped.__dict__.update(inst.__dict__)
                 stripped.prefix = ''
+                stripped.address = -1
                 self.lift_instruction(stripped, func_start)
                 self._emit('if (!zf(cpu)) break;')
                 self.indent -= 1
@@ -655,6 +698,7 @@ class Lifter:
                 stripped = Instruction()
                 stripped.__dict__.update(inst.__dict__)
                 stripped.prefix = ''
+                stripped.address = -1
                 self.lift_instruction(stripped, func_start)
                 self._emit('if (zf(cpu)) break;')
                 self.indent -= 1

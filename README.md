@@ -177,7 +177,7 @@ overlay modules that are demand-loaded via `INT 3Fh` when called:
 ```
 civ/
 ├── README.md                    # This file
-├── CMakeLists.txt               # Root build configuration
+├── CMakeLists.txt               # Root build configuration (CMake 3.20+)
 ├── civ.syms.toml                # Exported function symbol table
 ├── .gitignore                   # Excludes game files and build output
 ├── tools/                       # Reverse engineering & analysis tools
@@ -190,13 +190,32 @@ civ/
 │       ├── analyze.py           # Function boundary & call graph analyzer
 │       ├── lift.py              # x86-16 to C code lifter
 │       └── recomp.py            # Main recompilation driver
-├── include/recomp/
-│   └── cpu.h                    # CPU state struct (registers, flags, memory)
-├── src/recomp/
-│   └── cpu.c                    # CPU state management
+├── include/                     # Public headers
+│   ├── recomp/
+│   │   ├── cpu.h                # CPU state struct (registers, flags, memory)
+│   │   └── dos_compat.h         # DOS API compatibility layer
+│   ├── hal/
+│   │   ├── video.h              # VGA Mode 13h emulation
+│   │   ├── input.h              # Keyboard & mouse HAL
+│   │   └── timer.h              # PIT timer emulation
+│   └── platform/
+│       └── sdl_platform.h       # SDL2 platform layer
+├── src/
+│   ├── main.c                   # Entry point & main game loop
+│   ├── recomp/
+│   │   ├── cpu.c                # CPU state management
+│   │   ├── dos_compat.c         # Full INT 21h/10h/16h/33h implementation
+│   │   └── startup.c            # MSC crt0 replacement
+│   ├── hal/
+│   │   ├── video.c              # VGA DAC palette, mode 13h, vsync
+│   │   ├── input.c              # Keyboard buffer, mouse state
+│   │   └── timer.c              # PIT timer tick emulation
+│   └── platform/
+│       └── sdl_platform.c       # SDL2 window, rendering, input events
 └── RecompiledFuncs/             # Auto-generated C output (gitignored)
     ├── civ_recomp.h             # Master header (482 function declarations)
-    └── civ_recomp_000..009.c    # Recompiled game code (132K lines)
+    ├── civ_recomp_000..009.c    # Recompiled game code (132K lines)
+    └── civ_stubs.c              # Stub functions for unresolved symbols
 ```
 
 ---
@@ -207,14 +226,29 @@ civ/
 
 - **CMake** 3.20+
 - **MSVC** (Visual Studio 2022) or **MinGW-w64**
-- **Python 3** (for recompilation toolchain, future)
-- **SDL2** (for HAL layer, future)
+- **Python 3** (for recompilation toolchain)
+- **SDL2** via [vcpkg](https://github.com/microsoft/vcpkg): `vcpkg install sdl2:x64-windows`
 
-### Build Tools
+### Building
 
 ```bash
-cmake -B build -G "Visual Studio 17 2022"
+# Step 1: Run the recompiler (generates C files from CIV.EXE)
+py -3 tools/recomp/recomp.py path/to/CIV.EXE RecompiledFuncs
+
+# Step 2: Configure CMake with vcpkg
+cmake -B build -G "Visual Studio 17 2022" -A x64 \
+    -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+
+# Step 3: Build
 cmake --build build --config Release
+```
+
+### Running
+
+```bash
+# Run from the game data directory
+cd path/to/game/data
+path/to/build/Release/civ.exe --gamedir . --scale 3
 ```
 
 ### Running Analysis Tools
@@ -263,7 +297,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [ ] .CVL sound format reverse engineering
 - [ ] .CV font format analysis
 
-### Phase 1 — Recompilation Toolchain *(current)*
+### Phase 1 — Recompilation Toolchain
 
 - [x] 16-bit x86 instruction decoder (full 8086/80186 opcode coverage)
 - [x] Function boundary detection (MSC 5.x prologue/epilogue patterns)
@@ -271,37 +305,60 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [x] x86-16 to C lifter (CPU state struct approach)
 - [x] MSC overlay call resolution (INT 3Fh -> direct C function calls)
 - [x] Segment:offset -> flat memory translation
+- [x] Port I/O lifting (IN/OUT -> port_in8/port_out8 dispatch)
 - [x] Batch compilation output (split across .c files)
 - [x] Symbol table export (TOML format)
+- [x] Stub generation for unresolved symbols (553 stubs)
 
 **Recompilation Results:**
 ```
   Functions:     482 (329 resident + 153 overlay)
   Instructions:  106,935
   Code bytes:    280,991 (274.4 KB)
-  Output:        132,585 lines of C across 10 source files
+  Output:        132,585 lines of C across 10 source files + 553 stubs
   Errors:        0
 ```
 
-### Phase 2 — DOS Compatibility Layer
+### Phase 2 — DOS Compatibility Layer *(current)*
 
-- [ ] INT 21h replacement (file I/O, memory, process control)
-- [ ] DOS memory model emulation (near/far pointers, segments)
-- [ ] VGA Mode 13h framebuffer (320x200, 256 colors)
-- [ ] VGA palette register emulation (DAC)
-- [ ] Timer tick emulation (INT 08h/1Ch)
-- [ ] Basic C runtime (MSC 5.x compatible)
+- [x] INT 21h replacement (file I/O: create/open/close/read/write/seek/delete)
+- [x] INT 21h memory management (alloc/free/resize paragraphs)
+- [x] INT 21h console I/O (char in/out, print string, input status)
+- [x] INT 21h system calls (date/time, DOS version, drive/directory, interrupt vectors)
+- [x] INT 10h Video BIOS (set mode, cursor, teletype, get mode)
+- [x] INT 16h Keyboard BIOS (read key, check key, shift flags)
+- [x] INT 33h Mouse Driver (reset, show/hide, position, range, handler)
+- [x] VGA Mode 13h framebuffer (320x200, 256 colors at A000:0000)
+- [x] VGA DAC palette emulation (ports 3C7/3C8/3C9 state machine)
+- [x] VGA input status register (port 3DA, vsync toggle)
+- [x] PIT timer emulation (ports 40h/43h, 18.2 Hz tick rate)
+- [x] Port I/O dispatch (VGA, PIT, PIC, keyboard ports)
+- [x] DOS path translation (game directory mapping)
+- [x] SDL2 platform layer (window, renderer, streaming texture)
+- [x] SDL2 event handling (keyboard scancode map, mouse, fullscreen toggle)
+- [x] SDL2 VGA rendering (indexed framebuffer -> RGBA palette conversion)
+- [x] MSC crt0 startup replacement (segment register initialization)
+- [x] Main entry point with frame-driven game loop
+- [x] **Full project compiles and links (zero errors, zero warnings)**
+- [ ] Cooperative yielding for game main loop (Phase 4)
+- [ ] Resolve 553 stub functions (identify C library vs game functions)
 
-### Phase 3 — Hardware Abstraction Layer
+**Build Output:**
+```
+  civ.exe           22 KB     Main executable
+  civ_recomp.lib    6.0 MB    Recompiled game code (482 functions + 553 stubs)
+  civ_hal.lib       36 KB     HAL + DOS compatibility
+  civ_platform.lib  13 KB     SDL2 platform layer
+  SDL2.dll          1.6 MB    SDL2 runtime
+```
 
-- [ ] SDL2 window + rendering (320x200 → scaled)
-- [ ] SDL2 keyboard input (INT 16h replacement)
-- [ ] SDL2 mouse input (INT 33h replacement)
-- [ ] SDL2 audio output (AdLib OPL2 synthesis or PCM playback)
+### Phase 3 — Game Data & Audio HAL
+
 - [ ] .PIC image loader (native format support)
 - [ ] .PAL palette loader
 - [ ] .CVL sound data loader
 - [ ] .CV font renderer
+- [ ] SDL2 audio output (AdLib OPL2 synthesis or PCM playback)
 
 ### Phase 4 — Integration & Testing
 
