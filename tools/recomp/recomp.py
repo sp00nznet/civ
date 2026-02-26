@@ -74,6 +74,13 @@ def recompile(exe_path: str, output_dir: str, funcs_per_file: int = 50):
     for ovl in analyzer.overlays:
         overlay_bases[ovl.index] = ovl.code_offset
 
+    # Build known function address -> name map (for resolving far calls)
+    known_funcs = {}
+    for func in analyzer.functions:
+        known_funcs[func.start] = func.name
+
+    hdr_size = analyzer.hdr_size
+
     # Lift each function
     print("\n--- Phase 2: Lifting ---")
     os.makedirs(output_dir, exist_ok=True)
@@ -89,7 +96,8 @@ def recompile(exe_path: str, output_dir: str, funcs_per_file: int = 50):
         instructions = decoder.decode_range(0, len(code))
 
         # Lift
-        lifter = Lifter(overlay_bases=overlay_bases)
+        lifter = Lifter(overlay_bases=overlay_bases, hdr_size=hdr_size,
+                         known_funcs=known_funcs)
         try:
             c_code = lifter.lift_function(
                 func.name, instructions, func.start, func.is_far)

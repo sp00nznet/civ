@@ -213,33 +213,26 @@ int main(int argc, char *argv[])
      * loop can be interleaved with SDL event processing.
      */
 
-    /* For initial testing, run in a simple loop */
+    /*
+     * The game's entry point runs the MSC startup, then calls
+     * ovl05_031396 (C main), which calls ovl21_048200 (game loop).
+     * The game runs as a single blocking call - it loops internally.
+     * When it exits (INT 21h/4Ch), cpu.halted is set and it returns.
+     *
+     * For now, call the entry point once. The game's internal loops
+     * will run to completion. DOS API calls (INT 21h, etc.) handle
+     * all I/O through our compatibility layer.
+     *
+     * TODO: Phase 4 - Add cooperative yielding so the game's internal
+     * loops interleave with SDL event processing for proper rendering.
+     */
+    CIV_ENTRY_POINT(&cpu);
+
+    /* If the game returns without halting, run a post-game render loop */
     while (plat.running && !cpu.halted) {
-        uint64_t frame_start = platform_get_ticks();
-
-        /* Poll input events */
         platform_poll_events(&plat, &dos);
-
-        /* Update timer */
-        timer_update(&dos.timer, platform_get_ticks());
-
-        /* Call the game's entry point / main loop tick
-         * NOTE: In the initial version, this calls the full entry point
-         * which may not return until the game exits. Phase 4 will add
-         * proper cooperative yielding. */
-        if (!cpu.halted) {
-            CIV_ENTRY_POINT(&cpu);
-        }
-
-        /* Render VGA framebuffer */
         platform_render(&plat, &cpu, &dos);
-
-        /* Frame rate limiting */
-        uint64_t frame_end = platform_get_ticks();
-        uint64_t elapsed = frame_end - frame_start;
-        if (elapsed < FRAME_TIME_MS) {
-            platform_delay((uint32_t)(FRAME_TIME_MS - elapsed));
-        }
+        platform_delay(FRAME_TIME_MS);
     }
 
     printf("\n[MAIN] Game ended.\n");

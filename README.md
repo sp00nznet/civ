@@ -319,7 +319,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
   Errors:        0
 ```
 
-### Phase 2 — DOS Compatibility Layer *(current)*
+### Phase 2 — DOS Compatibility Layer
 
 - [x] INT 21h replacement (file I/O: create/open/close/read/write/seek/delete)
 - [x] INT 21h memory management (alloc/free/resize paragraphs)
@@ -337,22 +337,34 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [x] SDL2 platform layer (window, renderer, streaming texture)
 - [x] SDL2 event handling (keyboard scancode map, mouse, fullscreen toggle)
 - [x] SDL2 VGA rendering (indexed framebuffer -> RGBA palette conversion)
-- [x] MSC crt0 startup replacement (segment register initialization)
+- [x] MSC crt0 startup replacement (segment register initialization + data copy)
 - [x] Main entry point with frame-driven game loop
 - [x] **Full project compiles and links (zero errors, zero warnings)**
-- [ ] Cooperative yielding for game main loop (Phase 4)
-- [ ] Resolve 553 stub functions (identify C library vs game functions)
+
+### Phase 3 — Stub Resolution & Call Graph *(current)*
+
+- [x] Traced MSC crt0 startup chain: `res_02A310` -> `ovl05_031396` (C main) -> `ovl21_048200` (game loop)
+- [x] Discovered CIV.EXE has **zero MZ relocations** — MSC overlay manager patches segments at runtime
+- [x] Reverse-engineered segment relocation formula: `file_off = seg*16 + off - 0x14`
+- [x] Far call resolution (CALL FAR seg:off -> known function): 1081+ calls resolved
+- [x] Stubs reduced from 553 -> 352 (36% reduction)
+- [x] Stub resolver tool (`resolve_stubs.py`) — maps unresolved names to existing functions
+- [x] Alias file (`civ_aliases.c`) — 79 wrapper functions for overlay/resident name mismatches
+- [ ] Resolve remaining 352 stubs (overlay dispatch table entries, MSC C library)
+- [ ] MSC overlay dispatch table mapping (7-byte thunk entries at seg 0000)
+- [ ] Detect 23 additional functions with standard prologues missed by analyzer
+- [ ] Game state initialization (replicate `__astart` at DS:0032)
 
 **Build Output:**
 ```
   civ.exe           22 KB     Main executable
-  civ_recomp.lib    6.0 MB    Recompiled game code (482 functions + 553 stubs)
+  civ_recomp.lib    6.0 MB    Recompiled game code (482 functions + 352 stubs)
   civ_hal.lib       36 KB     HAL + DOS compatibility
   civ_platform.lib  13 KB     SDL2 platform layer
   SDL2.dll          1.6 MB    SDL2 runtime
 ```
 
-### Phase 3 — Game Data & Audio HAL
+### Phase 4 — Game Data & Audio HAL
 
 - [ ] .PIC image loader (native format support)
 - [ ] .PAL palette loader
@@ -360,7 +372,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [ ] .CV font renderer
 - [ ] SDL2 audio output (AdLib OPL2 synthesis or PCM playback)
 
-### Phase 4 — Integration & Testing
+### Phase 5 — Integration & Testing
 
 - [ ] Boot sequence (MicroProse logo → title screen)
 - [ ] Menu navigation (New Game / Load / Earth / Custom)

@@ -104,7 +104,7 @@ def _label(addr: int, prefix: str = '') -> str:
 class Lifter:
     """Lifts x86-16 instructions to C code."""
 
-    def __init__(self, overlay_bases=None):
+    def __init__(self, overlay_bases=None, hdr_size=0x200, known_funcs=None):
         self.output = []
         self.indent = 1
         self.labels_needed = set()
@@ -114,6 +114,10 @@ class Lifter:
         self.valid_addrs = set()    # Valid instruction addresses in current function
         # Map overlay number -> code_offset (absolute file offset of overlay code start)
         self.overlay_bases = overlay_bases or {}
+        # MZ header size (for computing far call file offsets)
+        self.hdr_size = hdr_size
+        # Set of known function file offsets (for resolving far calls)
+        self.known_funcs = known_funcs or set()
 
     def _emit(self, code: str, comment: str = ''):
         """Emit a line of C code with optional comment."""
@@ -469,11 +473,36 @@ class Lifter:
         elif m == 'call':
             if op1 and op1.type == OpType.REL16:
                 target = func_start + op1.disp
-                func_name = f'res_{target:06X}'
+                # Look up known function name at this address
+                if target in self.known_funcs:
+                    func_name = self.known_funcs[target]
+                else:
+                    func_name = f'res_{target:06X}'
                 self.func_calls.add(func_name)
                 self._emit(f'{func_name}(cpu);', orig)
             elif op1 and op1.type == OpType.FAR:
-                func_name = f'far_{op1.far_seg:04X}_{op1.disp:04X}'
+                # Resolve far call segment:offset to a known function.
+                # CIV.EXE has NO MZ relocations - the MSC overlay manager
+                # patches segment values at runtime. The linker-assigned
+                # segments need a correction to map to file offsets:
+                #   file_off = seg*16 + off - 0x14  (most segments)
+                #   file_off = seg*16 + off - 0x1A  (segment 0x205A)
+                # We try both corrected and uncorrected formulas.
+                func_name = None
+                seg = op1.far_seg
+                off = op1.disp
+                # Try corrected formula (seg-specific adjustment)
+                corr = 0x1A if seg == 0x205A else 0x14
+                far_file_off = seg * 16 + off - corr
+                if far_file_off in self.known_funcs:
+                    func_name = self.known_funcs[far_file_off]
+                else:
+                    # Try original formula (hdr_size + seg*16 + off)
+                    far_file_off2 = self.hdr_size + seg * 16 + off
+                    if far_file_off2 in self.known_funcs:
+                        func_name = self.known_funcs[far_file_off2]
+                if not func_name:
+                    func_name = f'far_{seg:04X}_{off:04X}'
                 self.func_calls.add(func_name)
                 self._emit(f'{func_name}(cpu);', orig)
             else:

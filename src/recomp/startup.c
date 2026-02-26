@@ -3,23 +3,31 @@
  *
  * The original CIV.EXE entry point (CS:IP = 2A10:0010) is the MSC 5.x
  * C runtime startup code (crt0). It initializes the data segment, BSS,
- * stack, and performs relocation fixups before calling main().
+ * stack, copies initialized data, then calls through __astart to main().
+ *
+ * Startup chain traced from the binary:
+ *   1. res_02A310 (crt0) -> copies init data, RETF to __astart
+ *   2. __astart (DS:0032, file 0x030EB2) -> CRT init, window setup
+ *   3. ovl05_031396 -> C main() -> session setup
+ *   4. ovl21_048200 -> Game main loop (unit/turn processing)
  *
  * In our recompilation, the EXE image is loaded into flat memory and
- * the data is already in place. We just need to set up the segment
- * registers and call into the game's resident code.
+ * the data is already in place. We set up segment registers and call
+ * the game's C main() directly. The __astart initialization (window
+ * region setup via overlay dispatch table) is handled by init_game_data.
  *
  * Startup parameters extracted from the MSC header at CS:0000:
  *   DS offset:    0x30C8 (relative to load segment)
  *   SS offset:    0x399B (relative to load segment)
  *   SP:           0x0800
- *   Data to copy: 5353 bytes
+ *   Data to copy: 5353 bytes (0x14E9)
  *
  * Part of the Civ Recomp project (sp00nznet/civ)
  */
 
 #include "recomp/cpu.h"
 #include <stdio.h>
+#include <string.h>
 
 /* MSC startup fields from the CIV.EXE header */
 #define CIV_DS_OFFSET  0x30C8   /* DS = LOAD_SEG + this */
@@ -27,13 +35,19 @@
 #define CIV_SP_VALUE   0x0800   /* Initial stack pointer */
 #define CIV_LOAD_SEG   0x0100   /* DOS load segment */
 
+/* The crt0 copies 0x14E9 bytes of initialized data from the crt0
+ * segment (CS:0000) to the data segment (DS:0000). This sets up
+ * initialized global variables. We replicate this by copying from
+ * the source location in the loaded EXE image. */
+#define CIV_CRT0_SEG    0x2A10  /* CS value of crt0 segment */
+#define CIV_DATA_COPY_SIZE 0x14E9
+
 /*
  * res_02A310 - Entry point replacement
  *
- * This replaces the MSC crt0 startup code. Instead of running the
- * original startup assembly, we directly initialize the CPU state
- * as the startup would have left it, then call the first resident
- * function (which is the MSC __astart that calls main()).
+ * Replaces the MSC crt0 startup. Initializes CPU segment registers,
+ * copies initialized data to the data segment (as crt0 would), then
+ * calls the game's C main() function (ovl05_031396).
  */
 void res_02A310(CPU *cpu)
 {
@@ -47,25 +61,38 @@ void res_02A310(CPU *cpu)
            cpu->ds, cpu->es, cpu->ss, cpu->sp);
 
     /*
-     * The MSC startup copies initialized data from the code segment
-     * to the data segment. Since we loaded the entire EXE image into
-     * flat memory, the data is already at the correct offsets.
-     *
-     * The startup then calls the game's main() through the overlay
-     * manager. In our recomp, overlay calls are resolved to direct
-     * C function calls, so we call the first resident function that
-     * represents the game's initialization and main loop.
-     *
-     * res_000476 is the first detected function in the resident code
-     * and represents the beginning of the actual game code after the
-     * C library routines.
-     *
-     * TODO: Phase 4 - Identify the exact game main() function through
-     * call graph analysis and connect it properly.
+     * Replicate the crt0 data copy: copy initialized data from the
+     * crt0 code segment to the data segment. The source is at
+     * (LOAD_SEG + CRT0_SEG):0000 and destination is at DS:0000.
      */
+    uint32_t src_flat = seg_off(CIV_LOAD_SEG + CIV_CRT0_SEG, 0);
+    uint32_t dst_flat = seg_off(cpu->ds, 0);
+    if (src_flat + CIV_DATA_COPY_SIZE <= MEM_SIZE &&
+        dst_flat + CIV_DATA_COPY_SIZE <= MEM_SIZE) {
+        memcpy(cpu->mem + dst_flat, cpu->mem + src_flat, CIV_DATA_COPY_SIZE);
+        printf("[STARTUP] Copied %d bytes of initialized data\n", CIV_DATA_COPY_SIZE);
+    }
 
-    /* For now, call the first resident function which begins the
-     * MSC library initialization chain */
-    extern void res_000476(CPU *cpu);
-    res_000476(cpu);
+    /* Clear BSS (zero out remaining data segment after initialized data) */
+    uint32_t bss_start = dst_flat + CIV_DATA_COPY_SIZE;
+    uint32_t bss_size = 0x2000;  /* Conservative BSS size */
+    if (bss_start + bss_size <= MEM_SIZE) {
+        memset(cpu->mem + bss_start, 0, bss_size);
+    }
+
+    /* Set up the stack frame as MSC expects for main() */
+    cpu->bp = cpu->sp;
+
+    printf("[STARTUP] Calling game main (ovl05_031396)...\n");
+
+    /*
+     * Call the game's C main() function directly.
+     * ovl05_031396 is the game's main() - it performs session setup,
+     * then calls ovl21_048200 (the actual game main loop).
+     */
+    extern void ovl05_031396(CPU *cpu);
+    ovl05_031396(cpu);
+
+    printf("[STARTUP] Game main returned, setting halted flag\n");
+    cpu->halted = 1;
 }
