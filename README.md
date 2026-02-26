@@ -178,26 +178,25 @@ overlay modules that are demand-loaded via `INT 3Fh` when called:
 civ/
 ├── README.md                    # This file
 ├── CMakeLists.txt               # Root build configuration
+├── civ.syms.toml                # Exported function symbol table
 ├── .gitignore                   # Excludes game files and build output
 ├── tools/                       # Reverse engineering & analysis tools
 │   ├── CMakeLists.txt
 │   ├── mzparse/                 # MZ header & overlay analyzer
-│   │   ├── CMakeLists.txt
-│   │   └── mzparse.c
 │   ├── ovldump/                 # Overlay module extractor
-│   │   ├── CMakeLists.txt
-│   │   └── ovldump.c
-│   └── picdecode/               # .PIC/.PAL image format analyzer
-│       ├── CMakeLists.txt
-│       └── picdecode.c
-├── src/                         # Recompilation source (future)
-│   ├── hal/                     # Hardware abstraction layer
-│   ├── platform/                # Platform layer (SDL2, Win32)
-│   └── recomp/                  # Recompiled game code (from civ.exe)
-└── include/                     # Headers
-    ├── hal/
-    ├── platform/
-    └── recomp/
+│   ├── picdecode/               # .PIC/.PAL image format analyzer
+│   └── recomp/                  # Static recompilation toolchain
+│       ├── decode16.py          # 16-bit x86 instruction decoder
+│       ├── analyze.py           # Function boundary & call graph analyzer
+│       ├── lift.py              # x86-16 to C code lifter
+│       └── recomp.py            # Main recompilation driver
+├── include/recomp/
+│   └── cpu.h                    # CPU state struct (registers, flags, memory)
+├── src/recomp/
+│   └── cpu.c                    # CPU state management
+└── RecompiledFuncs/             # Auto-generated C output (gitignored)
+    ├── civ_recomp.h             # Master header (482 function declarations)
+    └── civ_recomp_000..009.c    # Recompiled game code (132K lines)
 ```
 
 ---
@@ -231,35 +230,58 @@ build/Release/ovldump.exe path/to/civ.exe output_dir/
 build/Release/picdecode.exe path/to/logo.pic
 ```
 
+### Running the Recompiler
+
+```bash
+# Disassemble resident code
+py -3 tools/recomp/decode16.py path/to/civ.exe --resident
+
+# Disassemble overlay N
+py -3 tools/recomp/decode16.py path/to/civ.exe --overlay 5
+
+# Analyze function boundaries
+py -3 tools/recomp/analyze.py path/to/civ.exe -symbols civ.syms.toml
+
+# Full recompilation (generates C files)
+py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
+```
+
 ---
 
 ## Progress
 
-### Phase 0 — Binary Analysis & Documentation *(current)*
+### Phase 0 — Binary Analysis & Documentation
 
 - [x] MZ header parsing and structure analysis
 - [x] Microsoft C overlay manager identification (INT 3Fh)
 - [x] Overlay module enumeration (23 modules, 83 functions)
 - [x] DOS interrupt surface mapping
-- [x] String table extraction
+- [x] String table extraction (1,807 strings)
 - [x] Support executable identification
 - [x] Game data file inventory
-- [ ] Complete function boundary detection in resident code
-- [ ] Overlay function signature analysis
 - [ ] .PIC image format reverse engineering
 - [ ] .CVL sound format reverse engineering
 - [ ] .CV font format analysis
-- [ ] Complete disassembly with symbolic names
 
-### Phase 1 — Recompilation Toolchain
+### Phase 1 — Recompilation Toolchain *(current)*
 
-- [ ] 16-bit x86 disassembler (real mode, segmented memory)
-- [ ] Function boundary detection (prologue/epilogue analysis)
-- [ ] x86-16 → C lifter (register state struct approach)
-- [ ] MSC overlay call resolution (INT 3Fh → direct calls)
-- [ ] Segment:offset → flat memory translation
-- [ ] Relocation-free code handling
-- [ ] Batch compilation output (split across .c files)
+- [x] 16-bit x86 instruction decoder (full 8086/80186 opcode coverage)
+- [x] Function boundary detection (MSC 5.x prologue/epilogue patterns)
+- [x] Control flow analysis and call graph extraction
+- [x] x86-16 to C lifter (CPU state struct approach)
+- [x] MSC overlay call resolution (INT 3Fh -> direct C function calls)
+- [x] Segment:offset -> flat memory translation
+- [x] Batch compilation output (split across .c files)
+- [x] Symbol table export (TOML format)
+
+**Recompilation Results:**
+```
+  Functions:     482 (329 resident + 153 overlay)
+  Instructions:  106,935
+  Code bytes:    280,991 (274.4 KB)
+  Output:        132,585 lines of C across 10 source files
+  Errors:        0
+```
 
 ### Phase 2 — DOS Compatibility Layer
 
