@@ -1,0 +1,32 @@
+# Original game files - user must supply their own copy
+*.7z
+*.zip
+*.iso
+game/
+
+# Build output
+build/
+out/
+cmake-build-*/
+
+# IDE files
+.vs/
+.vscode/
+*.vcxproj.user
+*.suo
+
+# Claude settings
+.claude/
+
+# Tool output
+analysis/
+*.bmp
+*.png
+*.wav
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Extracted/working data
+extracted/
