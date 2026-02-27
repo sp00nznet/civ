@@ -157,6 +157,21 @@ def recompile(exe_path: str, output_dir: str, funcs_per_file: int = 50):
 
     # Generate stubs for unresolved symbols (functions referenced but not defined)
     unresolved = all_referenced - all_names
+
+    # Exclude functions that have hand-written implementations in civ_impl.c
+    # or civ_aliases.c (these files are not auto-generated)
+    impl_funcs = set()
+    for impl_file in ['civ_impl.c', 'civ_aliases.c']:
+        impl_path = os.path.join(output_dir, impl_file)
+        if os.path.exists(impl_path):
+            import re
+            with open(impl_path, 'r') as f:
+                for match in re.finditer(r'^void\s+(\w+)\s*\(', f.read(), re.MULTILINE):
+                    impl_funcs.add(match.group(1))
+    if impl_funcs:
+        unresolved -= impl_funcs
+        print(f"  Excluded {len(impl_funcs)} functions with hand-written implementations")
+
     if unresolved:
         stub_file = os.path.join(output_dir, 'civ_stubs.c')
         with open(stub_file, 'w') as out:

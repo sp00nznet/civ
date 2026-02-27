@@ -479,6 +479,8 @@ class Lifter:
                 else:
                     func_name = f'res_{target:06X}'
                 self.func_calls.add(func_name)
+                # Simulate NEAR CALL: push 2-byte return IP on CPU stack
+                self._emit(f'push16(cpu, 0);', f'near call return addr')
                 self._emit(f'{func_name}(cpu);', orig)
             elif op1 and op1.type == OpType.FAR:
                 # Resolve far call segment:offset to a known function.
@@ -504,26 +506,32 @@ class Lifter:
                 if not func_name:
                     func_name = f'far_{seg:04X}_{off:04X}'
                 self.func_calls.add(func_name)
+                # Simulate FAR CALL: push 4-byte return CS:IP on CPU stack
+                self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0);', f'far call return addr')
                 self._emit(f'{func_name}(cpu);', orig)
             else:
                 self._emit(f'/* indirect call {repr(op1)} - needs dispatch */', orig)
 
         elif m == 'ret':
+            # Simulate NEAR RET: pop 2-byte return IP + optional extra bytes
             if op1:
-                self._emit(f'cpu->sp += {_read(op1)}; return;', orig)
+                total = op1.disp + 2
+                self._emit(f'cpu->sp += 0x{total:X}; return;', orig)
             else:
-                self._emit('return;', orig)
+                self._emit('cpu->sp += 2; return;', orig)
 
         elif m == 'retf':
+            # Simulate FAR RETF: pop 4-byte return CS:IP + optional extra bytes
             if op1:
-                self._emit(f'cpu->sp += {_read(op1)}; return;', orig)
+                total = op1.disp + 4
+                self._emit(f'cpu->sp += 0x{total:X}; return;', orig)
             else:
-                self._emit('return;', orig)
+                self._emit('cpu->sp += 4; return;', orig)
 
         elif m == 'int':
             int_num = op1.disp
             if int_num == 0x3F and inst.overlay_num >= 0:
-                # Overlay call - resolved to direct function call
+                # Overlay call - resolved to direct function call (far call semantics)
                 # Compute absolute file offset from overlay base + relative offset
                 ovl_num = inst.overlay_num
                 ovl_off = inst.overlay_off
@@ -533,6 +541,9 @@ class Lifter:
                 else:
                     func_name = f'ovl{ovl_num:02d}_{ovl_off:04X}'
                 self.ovl_calls.add(func_name)
+                # Simulate FAR CALL for overlay dispatch
+                self._emit(f'push16(cpu, cpu->cs); push16(cpu, 0);',
+                           f'overlay far call return addr')
                 self._emit(f'{func_name}(cpu);',
                            f'INT 3Fh -> OVL {ovl_num:02X}:{ovl_off:04X}')
             elif int_num == 0x21:

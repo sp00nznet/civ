@@ -132,21 +132,18 @@ void dos_int21(CPU *cpu)
 
     case 0x01: /* Character input with echo (blocking) */ {
         KeyboardState *ks = &g_dos->keyboard;
-        if (keyboard_available(ks)) {
-            uint16_t key = keyboard_read(ks);
-            cpu->al = (uint8_t)(key & 0xFF);
-        } else {
-            /* No key available - return '1' to select first menu option.
-             * The game's startup menus expect digit keys ('1'-'9').
-             * TODO: Integrate with SDL event loop for proper input. */
-            cpu->al = 0x31;  /* '1' */
+        /* Block until a key is available, pumping the event loop */
+        while (!keyboard_available(ks)) {
+            if (g_dos->poll_events)
+                g_dos->poll_events(g_dos->platform_ctx, g_dos, cpu);
         }
-        putchar(cpu->al);  /* echo the character */
+        uint16_t key = keyboard_read(ks);
+        cpu->al = (uint8_t)(key & 0xFF);
         break;
     }
 
     case 0x02: /* Character output */
-        putchar(cpu->dl);
+        /* Silently consume - game text goes via INT 10h to VGA memory */
         break;
 
     case 0x08: /* Character input without echo */
@@ -163,9 +160,14 @@ void dos_int21(CPU *cpu)
     }
 
     case 0x09: { /* Print string (terminated by '$') */
+        /* Output to text mode video memory via INT 10h teletype */
         uint32_t addr = seg_off(cpu->ds, cpu->dx);
-        while (cpu->mem[addr] != '$' && addr < MEM_SIZE) {
-            putchar(cpu->mem[addr]);
+        while (addr < MEM_SIZE && cpu->mem[addr] != '$') {
+            cpu->al = cpu->mem[addr];
+            uint8_t save_ah = cpu->ah;
+            cpu->ah = 0x0E;
+            bios_int10(cpu);
+            cpu->ah = save_ah;
             addr++;
         }
         break;
@@ -422,33 +424,86 @@ void dos_int21(CPU *cpu)
 
 /* ─── INT 10h - Video BIOS ─── */
 
+/* Text mode video memory at 0xB8000, 80x25, 2 bytes per cell (char + attr) */
+#define TEXT_MODE_BASE  0xB8000
+#define TEXT_COLS       80
+#define TEXT_ROWS       25
+
 void bios_int10(CPU *cpu)
 {
     switch (cpu->ah) {
     case 0x00: /* Set video mode */
-        /* Mode 13h setup - already initialized */
+        /* Store current mode in BIOS data area */
+        mem_write8(cpu, 0x0040, 0x0049, cpu->al);
+        if (cpu->al == 0x13) {
+            /* Mode 13h: 320x200x256 - clear VGA framebuffer */
+            memset(&cpu->mem[0xA0000], 0, 64000);
+        } else if (cpu->al == 0x03) {
+            /* Mode 3: 80x25 text - clear text mode buffer */
+            memset(&cpu->mem[TEXT_MODE_BASE], 0, TEXT_COLS * TEXT_ROWS * 2);
+        }
         break;
 
     case 0x02: /* Set cursor position */
         /* BH = page, DH = row, DL = column */
-        /* Store in BIOS data area */
         mem_write8(cpu, 0x0040, 0x0050, cpu->dl);
         mem_write8(cpu, 0x0040, 0x0051, cpu->dh);
         break;
 
+    case 0x03: /* Get cursor position */
+        /* BH = page → returns DH=row, DL=column, CH/CL=cursor shape */
+        cpu->dl = mem_read8(cpu, 0x0040, 0x0050);
+        cpu->dh = mem_read8(cpu, 0x0040, 0x0051);
+        cpu->ch = 0;
+        cpu->cl = 0;
+        break;
+
     case 0x09: /* Write character and attribute at cursor */
         /* AL = character, BL = attribute, CX = count */
-        for (int i = 0; i < cpu->cx; i++)
-            putchar(cpu->al);
+        /* Write to text mode video memory (no cursor advance) */ {
+        uint8_t col = mem_read8(cpu, 0x0040, 0x0050);
+        uint8_t row = mem_read8(cpu, 0x0040, 0x0051);
+        for (int i = 0; i < cpu->cx; i++) {
+            int pos = (row * TEXT_COLS + col + i) % (TEXT_COLS * TEXT_ROWS);
+            uint32_t addr = TEXT_MODE_BASE + pos * 2;
+            if (addr + 1 < MEM_SIZE) {
+                cpu->mem[addr] = cpu->al;
+                cpu->mem[addr + 1] = (uint8_t)cpu->bl;
+            }
+        }
         break;
+        }
 
     case 0x0E: /* Teletype output */
-        putchar(cpu->al);
+        /* Write character and advance cursor */ {
+        uint8_t col = mem_read8(cpu, 0x0040, 0x0050);
+        uint8_t row = mem_read8(cpu, 0x0040, 0x0051);
+        if (cpu->al == 0x0D) {
+            col = 0;  /* Carriage return */
+        } else if (cpu->al == 0x0A) {
+            row++;    /* Line feed */
+        } else if (cpu->al == 0x08) {
+            if (col > 0) col--;  /* Backspace */
+        } else {
+            int pos = row * TEXT_COLS + col;
+            uint32_t addr = TEXT_MODE_BASE + pos * 2;
+            if (addr + 1 < MEM_SIZE) {
+                cpu->mem[addr] = cpu->al;
+                cpu->mem[addr + 1] = 0x07; /* Default attribute */
+            }
+            col++;
+            if (col >= TEXT_COLS) { col = 0; row++; }
+        }
+        if (row >= TEXT_ROWS) row = TEXT_ROWS - 1;
+        mem_write8(cpu, 0x0040, 0x0050, col);
+        mem_write8(cpu, 0x0040, 0x0051, row);
         break;
+        }
 
     case 0x0F: /* Get video mode */
-        cpu->al = 0x13;  /* Mode 13h */
-        cpu->ah = 40;    /* Columns */
+        cpu->al = mem_read8(cpu, 0x0040, 0x0049);
+        if (cpu->al == 0) cpu->al = 0x03; /* Default to mode 3 */
+        cpu->ah = (cpu->al == 0x13) ? 40 : TEXT_COLS;
         cpu->bh = 0;     /* Page */
         break;
 

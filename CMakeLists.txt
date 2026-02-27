@@ -55,6 +55,7 @@ file(GLOB RECOMP_SOURCES
     "${CMAKE_SOURCE_DIR}/RecompiledFuncs/civ_recomp_*.c"
     "${CMAKE_SOURCE_DIR}/RecompiledFuncs/civ_stubs.c"
     "${CMAKE_SOURCE_DIR}/RecompiledFuncs/civ_aliases.c"
+    "${CMAKE_SOURCE_DIR}/RecompiledFuncs/civ_impl.c"
 )
 
 if(RECOMP_SOURCES)
