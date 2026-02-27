@@ -18,10 +18,12 @@
 typedef struct {
     void *window;       /* SDL_Window* */
     void *renderer;     /* SDL_Renderer* */
-    void *texture;      /* SDL_Texture* (streaming, for framebuffer) */
+    void *tex_vga;      /* SDL_Texture* for VGA mode 13h (320x200) */
+    void *tex_text;     /* SDL_Texture* for text mode (640x200) */
     int   scale;
     int   running;
     int   fullscreen;
+    int   last_mode;    /* Track mode changes for texture switching */
 } Platform;
 
 /* Initialize SDL2 window and renderer */

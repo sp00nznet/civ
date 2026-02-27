@@ -132,6 +132,7 @@ void res_02A310(CPU *cpu)
     push16(cpu, 0);  /* argc */
 
     extern void res_001A66(CPU *cpu);
+    push16(cpu, 0);  /* near call return addr */
     res_001A66(cpu);
 
     printf("[STARTUP] C main returned, setting halted flag\n");

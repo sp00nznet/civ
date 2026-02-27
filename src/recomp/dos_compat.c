@@ -108,10 +108,10 @@ void dos_init(DosState *ds, CPU *cpu, const char *game_dir)
     mem_write16(cpu, 0x0040, 0x0010, 0x0021);  /* Color, 1 floppy */
     /* Memory size at 0040:0013 (in KB) */
     mem_write16(cpu, 0x0040, 0x0013, 640);
-    /* Video mode at 0040:0049 */
-    mem_write8(cpu, 0x0040, 0x0049, 0x13);  /* Mode 13h */
+    /* Video mode at 0040:0049 - start in text mode (game switches to 13h) */
+    mem_write8(cpu, 0x0040, 0x0049, 0x03);  /* Mode 3: 80x25 text */
     /* Screen columns at 0040:004A */
-    mem_write16(cpu, 0x0040, 0x004A, 40);
+    mem_write16(cpu, 0x0040, 0x004A, 80);
 
     ds->mem_top = 0x9000;  /* Top of available conventional memory */
 

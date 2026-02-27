@@ -9,10 +9,18 @@
  */
 
 #include "platform/sdl_platform.h"
+#include "font8x8.h"
 
 #include <SDL2/SDL.h>
 #include <stdio.h>
 #include <string.h>
+
+/* Text mode constants */
+#define TEXT_MODE_BASE  0xB8000
+#define TEXT_COLS       80
+#define TEXT_ROWS       25
+#define CHAR_W          4   /* pixels per character width  (80*4 = 320) */
+#define CHAR_H          8   /* pixels per character height (25*8 = 200) */
 
 int platform_init(Platform *plat, int scale)
 {
@@ -47,18 +55,26 @@ int platform_init(Platform *plat, int scale)
     }
     plat->renderer = ren;
 
-    /* Set logical size for automatic scaling */
-    SDL_RenderSetLogicalSize(ren, VGA_WIDTH, VGA_HEIGHT);
-
-    /* Create streaming texture for the framebuffer */
-    SDL_Texture *tex = SDL_CreateTexture(ren,
+    /* Create VGA mode 13h texture (320x200) */
+    SDL_Texture *tex_vga = SDL_CreateTexture(ren,
         SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING,
         VGA_WIDTH, VGA_HEIGHT);
-    if (!tex) {
-        fprintf(stderr, "[SDL] Texture creation failed: %s\n", SDL_GetError());
+    if (!tex_vga) {
+        fprintf(stderr, "[SDL] VGA texture creation failed: %s\n", SDL_GetError());
         return -1;
     }
-    plat->texture = tex;
+    plat->tex_vga = tex_vga;
+
+    /* Create text mode texture (640x200 for 80x25 with 8x8 font) */
+    SDL_Texture *tex_text = SDL_CreateTexture(ren,
+        SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING,
+        TEXT_COLS * 8, TEXT_ROWS * CHAR_H);
+    if (!tex_text) {
+        fprintf(stderr, "[SDL] Text texture creation failed: %s\n", SDL_GetError());
+        return -1;
+    }
+    plat->tex_text = tex_text;
+    plat->last_mode = -1;
 
     SDL_ShowCursor(SDL_DISABLE);
 
@@ -68,7 +84,8 @@ int platform_init(Platform *plat, int scale)
 
 void platform_shutdown(Platform *plat)
 {
-    if (plat->texture)  SDL_DestroyTexture((SDL_Texture *)plat->texture);
+    if (plat->tex_vga)  SDL_DestroyTexture((SDL_Texture *)plat->tex_vga);
+    if (plat->tex_text) SDL_DestroyTexture((SDL_Texture *)plat->tex_text);
     if (plat->renderer) SDL_DestroyRenderer((SDL_Renderer *)plat->renderer);
     if (plat->window)   SDL_DestroyWindow((SDL_Window *)plat->window);
     SDL_Quit();
@@ -183,26 +200,79 @@ void platform_poll_events(Platform *plat, DosState *dos)
     }
 }
 
+/* Render text mode (80x25 chars from 0xB8000) into 640x200 pixels.
+ * Each character cell is 8 pixels wide × 8 pixels tall using the CP437 font. */
+static void render_text_mode(const CPU *cpu, uint32_t *pixels, int pitch)
+{
+    const uint8_t *textbuf = cpu->mem + TEXT_MODE_BASE;
+
+    for (int row = 0; row < TEXT_ROWS; row++) {
+        for (int col = 0; col < TEXT_COLS; col++) {
+            int cell = (row * TEXT_COLS + col) * 2;
+            uint8_t ch   = textbuf[cell];
+            uint8_t attr = textbuf[cell + 1];
+
+            uint32_t fg = text_colors[attr & 0x0F];
+            uint32_t bg = text_colors[(attr >> 4) & 0x07]; /* high bit = blink, ignore */
+
+            const uint8_t *glyph = font8x8_cp437[ch];
+
+            for (int gy = 0; gy < CHAR_H; gy++) {
+                int py = row * CHAR_H + gy;
+                uint32_t *prow = (uint32_t *)((uint8_t *)pixels + py * pitch);
+                uint8_t bits = glyph[gy];
+                for (int gx = 0; gx < 8; gx++) {
+                    int px = col * 8 + gx;
+                    prow[px] = (bits & (0x80 >> gx)) ? fg : bg;
+                }
+            }
+        }
+    }
+}
+
 void platform_render(Platform *plat, const CPU *cpu, const DosState *dos)
 {
     SDL_Renderer *ren = (SDL_Renderer *)plat->renderer;
-    SDL_Texture *tex = (SDL_Texture *)plat->texture;
 
-    /* Build RGBA palette from VGA 6-bit */
-    uint32_t rgba[256];
-    video_get_rgba_palette(&dos->video, rgba);
+    /* Check video mode from BIOS data area */
+    uint8_t vmode = cpu->mem[0x449]; /* 0040:0049 */
+    int is_gfx = (vmode == 0x13);
 
-    /* Convert indexed framebuffer to RGBA */
+    /* Switch logical size when mode changes */
+    int mode_id = is_gfx ? 1 : 0;
+    if (mode_id != plat->last_mode) {
+        plat->last_mode = mode_id;
+        if (is_gfx) {
+            SDL_RenderSetLogicalSize(ren, VGA_WIDTH, VGA_HEIGHT);
+        } else {
+            SDL_RenderSetLogicalSize(ren, TEXT_COLS * 8, TEXT_ROWS * CHAR_H);
+        }
+    }
+
+    SDL_Texture *tex;
     uint32_t *pixels;
     int pitch;
-    SDL_LockTexture(tex, NULL, (void **)&pixels, &pitch);
 
-    const uint8_t *fb = cpu->mem + VGA_FB_ADDR;
-    for (int y = 0; y < VGA_HEIGHT; y++) {
-        uint32_t *row = (uint32_t *)((uint8_t *)pixels + y * pitch);
-        for (int x = 0; x < VGA_WIDTH; x++) {
-            row[x] = rgba[fb[y * VGA_WIDTH + x]];
+    if (is_gfx) {
+        /* Mode 13h: 320x200x256 VGA */
+        tex = (SDL_Texture *)plat->tex_vga;
+        SDL_LockTexture(tex, NULL, (void **)&pixels, &pitch);
+
+        uint32_t rgba[256];
+        video_get_rgba_palette(&dos->video, rgba);
+
+        const uint8_t *fb = cpu->mem + VGA_FB_ADDR;
+        for (int y = 0; y < VGA_HEIGHT; y++) {
+            uint32_t *row = (uint32_t *)((uint8_t *)pixels + y * pitch);
+            for (int x = 0; x < VGA_WIDTH; x++) {
+                row[x] = rgba[fb[y * VGA_WIDTH + x]];
+            }
         }
+    } else {
+        /* Text mode (mode 3 or default): render from 0xB8000 */
+        tex = (SDL_Texture *)plat->tex_text;
+        SDL_LockTexture(tex, NULL, (void **)&pixels, &pitch);
+        render_text_mode(cpu, pixels, pitch);
     }
 
     SDL_UnlockTexture(tex);
