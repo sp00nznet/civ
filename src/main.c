@@ -22,6 +22,19 @@
 /* Entry point provided by startup.c (replaces MSC crt0) */
 extern void res_02A310(CPU *cpu);
 
+/* Poll callback: pumps SDL events and renders the framebuffer.
+ * Called from within game code when it blocks waiting for input. */
+static void game_poll_callback(void *platform_ctx, void *dos_state, const void *cpu)
+{
+    Platform *plat = (Platform *)platform_ctx;
+    DosState *dos = (DosState *)dos_state;
+    const CPU *c = (const CPU *)cpu;
+
+    platform_poll_events(plat, dos);
+    platform_render(plat, c, dos);
+    platform_delay(1); /* Yield CPU to avoid 100% spin */
+}
+
 /*
  * MZ Header values for CIV.EXE (from binary analysis):
  *   Header size:      0x200 bytes (32 paragraphs)
@@ -184,6 +197,11 @@ int main(int argc, char *argv[])
         cpu_free(&cpu);
         return 1;
     }
+
+    /* Hook the platform event loop into the DOS layer so blocking
+     * I/O calls (getch, kbhit, etc.) can pump SDL events. */
+    dos.poll_events = game_poll_callback;
+    dos.platform_ctx = &plat;
 
     printf("[MAIN] Starting game...\n\n");
 

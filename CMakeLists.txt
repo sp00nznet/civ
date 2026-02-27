@@ -54,6 +54,7 @@ target_link_libraries(civ_platform PUBLIC SDL2::SDL2 SDL2::SDL2main)
 file(GLOB RECOMP_SOURCES
     "${CMAKE_SOURCE_DIR}/RecompiledFuncs/civ_recomp_*.c"
     "${CMAKE_SOURCE_DIR}/RecompiledFuncs/civ_stubs.c"
+    "${CMAKE_SOURCE_DIR}/RecompiledFuncs/civ_aliases.c"
 )
 
 if(RECOMP_SOURCES)

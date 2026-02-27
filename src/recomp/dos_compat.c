@@ -130,6 +130,21 @@ void dos_int21(CPU *cpu)
         cpu->halted = 1;
         break;
 
+    case 0x01: /* Character input with echo (blocking) */ {
+        KeyboardState *ks = &g_dos->keyboard;
+        if (keyboard_available(ks)) {
+            uint16_t key = keyboard_read(ks);
+            cpu->al = (uint8_t)(key & 0xFF);
+        } else {
+            /* No key available - return '1' to select first menu option.
+             * The game's startup menus expect digit keys ('1'-'9').
+             * TODO: Integrate with SDL event loop for proper input. */
+            cpu->al = 0x31;  /* '1' */
+        }
+        putchar(cpu->al);  /* echo the character */
+        break;
+    }
+
     case 0x02: /* Character output */
         putchar(cpu->dl);
         break;
@@ -137,13 +152,13 @@ void dos_int21(CPU *cpu)
     case 0x08: /* Character input without echo */
     case 0x07: {
         KeyboardState *ks = &g_dos->keyboard;
-        /* In recomp context, return from keyboard buffer or 0 */
-        if (keyboard_available(ks)) {
-            uint16_t key = keyboard_read(ks);
-            cpu->al = (uint8_t)(key & 0xFF);
-        } else {
-            cpu->al = 0;
+        /* Block until a key is available, pumping the event loop */
+        while (!keyboard_available(ks)) {
+            if (g_dos->poll_events)
+                g_dos->poll_events(g_dos->platform_ctx, g_dos, cpu);
         }
+        uint16_t key = keyboard_read(ks);
+        cpu->al = (uint8_t)(key & 0xFF);
         break;
     }
 
@@ -172,6 +187,8 @@ void dos_int21(CPU *cpu)
     }
 
     case 0x0B: /* Check keyboard input status */
+        if (g_dos->poll_events)
+            g_dos->poll_events(g_dos->platform_ctx, g_dos, cpu);
         cpu->al = keyboard_available(&g_dos->keyboard) ? 0xFF : 0x00;
         break;
 
@@ -449,15 +466,19 @@ void bios_int16(CPU *cpu)
     switch (cpu->ah) {
     case 0x00: /* Read key (blocking) */
     case 0x10: /* Extended read key */
-        if (keyboard_available(ks)) {
-            cpu->ax = keyboard_read(ks);
-        } else {
-            cpu->ax = 0;  /* No key - caller should poll/yield */
+        /* Block until a key is available, pumping the event loop */
+        while (!keyboard_available(ks)) {
+            if (g_dos->poll_events)
+                g_dos->poll_events(g_dos->platform_ctx, g_dos, cpu);
         }
+        cpu->ax = keyboard_read(ks);
         break;
 
     case 0x01: /* Check for key */
     case 0x11:
+        /* Pump events before checking */
+        if (g_dos->poll_events)
+            g_dos->poll_events(g_dos->platform_ctx, g_dos, cpu);
         if (keyboard_available(ks)) {
             cpu->ax = ks->keybuf[ks->head];
             cpu->flags &= ~FLAG_ZF;  /* Key available */

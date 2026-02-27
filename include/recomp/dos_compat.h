@@ -26,6 +26,11 @@ typedef struct {
     int   next_handle;
 } DosFileTable;
 
+/* Callback type for pumping the platform event loop.
+ * Called when the game blocks waiting for input or timer events.
+ * The platform layer fills the keyboard/mouse buffers via this callback. */
+typedef void (*dos_poll_fn)(void *platform_ctx, void *dos_state, const void *cpu);
+
 /* Global DOS state */
 typedef struct {
     DosFileTable    file_table;
@@ -40,6 +45,10 @@ typedef struct {
 
     /* Interrupt vector table (for get/set vector) */
     uint32_t        ivt[256];       /* seg:off packed as uint32 */
+
+    /* Platform event loop callback (set by main.c) */
+    dos_poll_fn     poll_events;
+    void           *platform_ctx;   /* Opaque pointer to Platform struct */
 } DosState;
 
 /* Initialize DOS compatibility layer */

@@ -36,6 +36,8 @@ int keyboard_available(const KeyboardState *ks)
 
 uint16_t keyboard_read(KeyboardState *ks)
 {
+    /* Non-blocking read: returns 0 if no key available.
+     * For blocking behavior, the caller should loop with event pumping. */
     if (ks->head == ks->tail) return 0;
     uint16_t key = ks->keybuf[ks->head];
     ks->head = (ks->head + 1) % 32;
