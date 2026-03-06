@@ -121,12 +121,30 @@ def recompile(exe_path: str, output_dir: str, funcs_per_file: int = 50):
         for name in sorted(all_referenced)
     )
 
+    # Collect hand-written implementations BEFORE writing output files,
+    # so we can exclude them from the auto-generated recomp files too.
+    import re
+    impl_funcs = set()
+    alias_externs = set()
+    for impl_file in ['civ_impl.c', 'civ_aliases.c']:
+        impl_path = os.path.join(output_dir, impl_file)
+        if os.path.exists(impl_path):
+            with open(impl_path, 'r') as f:
+                content = f.read()
+                for match in re.finditer(r'^void\s+(\w+)\s*\(', content, re.MULTILINE):
+                    impl_funcs.add(match.group(1))
+                for match in re.finditer(r'^extern\s+void\s+(\w+)\s*\(', content, re.MULTILINE):
+                    alias_externs.add(match.group(1))
+    if impl_funcs:
+        print(f"  Found {len(impl_funcs)} hand-written implementations to exclude from recomp files")
+
     # Write output files (split across multiple .c files)
     print(f"\n--- Phase 3: Output ---")
 
     file_idx = 0
     func_idx = 0
     total_files = 0
+    impl_skipped = 0
 
     while func_idx < len(all_lifted):
         batch = all_lifted[func_idx:func_idx + funcs_per_file]
@@ -141,6 +159,11 @@ def recompile(exe_path: str, output_dir: str, funcs_per_file: int = 50):
                 forward_decls=forward_decls,
             ))
             for func, code, calls, ovl_calls in batch:
+                # Skip functions that have hand-written implementations
+                if func.name in impl_funcs:
+                    out.write(f'\n/* {func.name}: excluded (hand-written in civ_impl.c) */\n\n')
+                    impl_skipped += 1
+                    continue
                 out.write(f'\n/* Function: {func.name}\n')
                 out.write(f' * Original: 0x{func.start:06X} - 0x{func.end:06X} '
                           f'({func.size} bytes, {func.inst_count} instructions)\n')
@@ -155,22 +178,22 @@ def recompile(exe_path: str, output_dir: str, funcs_per_file: int = 50):
         funcs_in_file = len(batch)
         print(f"  {filename}: {funcs_in_file} functions")
 
+    if impl_skipped:
+        print(f"  Skipped {impl_skipped} functions (hand-written in civ_impl.c)")
+
     # Generate stubs for unresolved symbols (functions referenced but not defined)
     unresolved = all_referenced - all_names
 
-    # Exclude functions that have hand-written implementations in civ_impl.c
-    # or civ_aliases.c (these files are not auto-generated)
-    impl_funcs = set()
-    for impl_file in ['civ_impl.c', 'civ_aliases.c']:
-        impl_path = os.path.join(output_dir, impl_file)
-        if os.path.exists(impl_path):
-            import re
-            with open(impl_path, 'r') as f:
-                for match in re.finditer(r'^void\s+(\w+)\s*\(', f.read(), re.MULTILINE):
-                    impl_funcs.add(match.group(1))
+    # Exclude impl functions from stubs
     if impl_funcs:
         unresolved -= impl_funcs
         print(f"  Excluded {len(impl_funcs)} functions with hand-written implementations")
+
+    # Add alias extern targets that aren't defined anywhere
+    alias_needs_stub = alias_externs - all_names - impl_funcs
+    if alias_needs_stub:
+        unresolved |= alias_needs_stub
+        print(f"  Added {len(alias_needs_stub)} alias extern targets to stubs")
 
     if unresolved:
         stub_file = os.path.join(output_dir, 'civ_stubs.c')
@@ -187,10 +210,17 @@ def recompile(exe_path: str, output_dir: str, funcs_per_file: int = 50):
             out.write('#include "recomp/cpu.h"\n')
             out.write('#include <stdio.h>\n\n')
             for name in sorted(unresolved):
+                # Determine return type: far calls (far_*, ovl*) use retf (sp += 4),
+                # near calls (res_*) use ret (sp += 2)
+                if name.startswith('far_') or name.startswith('ovl'):
+                    ret_adj = 4  # far retf
+                else:
+                    ret_adj = 2  # near ret
                 out.write(f'void {name}(CPU *cpu) {{\n')
                 out.write(f'    (void)cpu;\n')
-                out.write(f'    static int _warned = 0;\n')
-                out.write(f'    if (!_warned) {{ fprintf(stderr, "[STUB] {name} called\\n"); _warned = 1; }}\n')
+                out.write(f'    static int _count = 0; _count++;\n')
+                out.write(f'    if (_count == 1 || (_count % 10000) == 0) fprintf(stderr, "[STUB] {name} called (n=%d)\\n", _count);\n')
+                out.write(f'    cpu->sp += {ret_adj}; /* {"far" if ret_adj == 4 else "near"} ret */\n')
                 out.write(f'}}\n\n')
         print(f"  civ_stubs.c: {len(unresolved)} stub functions")
 

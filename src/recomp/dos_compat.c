@@ -17,6 +17,7 @@
  */
 
 #include "recomp/dos_compat.h"
+#include "hal/input.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -113,7 +114,7 @@ void dos_init(DosState *ds, CPU *cpu, const char *game_dir)
     /* Screen columns at 0040:004A */
     mem_write16(cpu, 0x0040, 0x004A, 80);
 
-    ds->mem_top = 0x9000;  /* Top of available conventional memory */
+    ds->mem_top = 0x4000;  /* Start of free far memory (after program code+data) */
 
     printf("[DOS] Initialized with game dir: %s\n", game_dir);
 }
@@ -132,13 +133,15 @@ void dos_int21(CPU *cpu)
 
     case 0x01: /* Character input with echo (blocking) */ {
         KeyboardState *ks = &g_dos->keyboard;
-        /* Block until a key is available, pumping the event loop */
+        fprintf(stderr, "[BLOCK] Waiting for key in INT 21h/01\n");
         while (!keyboard_available(ks)) {
             if (g_dos->poll_events)
                 g_dos->poll_events(g_dos->platform_ctx, g_dos, cpu);
         }
         uint16_t key = keyboard_read(ks);
         cpu->al = (uint8_t)(key & 0xFF);
+        fprintf(stderr, "[KEY] INT 21h/01: 0x%04X (ascii='%c')\n",
+                key, (cpu->al >= 32 && cpu->al < 127) ? cpu->al : '.');
         break;
     }
 
@@ -149,26 +152,36 @@ void dos_int21(CPU *cpu)
     case 0x08: /* Character input without echo */
     case 0x07: {
         KeyboardState *ks = &g_dos->keyboard;
-        /* Block until a key is available, pumping the event loop */
+        fprintf(stderr, "[BLOCK] Waiting for key in INT 21h/%02Xh\n", ah);
         while (!keyboard_available(ks)) {
             if (g_dos->poll_events)
                 g_dos->poll_events(g_dos->platform_ctx, g_dos, cpu);
         }
         uint16_t key = keyboard_read(ks);
         cpu->al = (uint8_t)(key & 0xFF);
+        fprintf(stderr, "[KEY] INT 21h/%02Xh: 0x%04X\n", ah, key);
         break;
     }
 
     case 0x09: { /* Print string (terminated by '$') */
-        /* Output to text mode video memory via INT 10h teletype */
+        /* Output to text mode video memory via INT 10h teletype.
+         * Safety: skip if the first byte isn't printable text -
+         * the game's overlay init calls this with pointers to binary data. */
         uint32_t addr = seg_off(cpu->ds, cpu->dx);
-        while (addr < MEM_SIZE && cpu->mem[addr] != '$') {
-            cpu->al = cpu->mem[addr];
-            uint8_t save_ah = cpu->ah;
-            cpu->ah = 0x0E;
-            bios_int10(cpu);
-            cpu->ah = save_ah;
-            addr++;
+        if (addr >= MEM_SIZE) break;
+        uint8_t first = cpu->mem[addr];
+        /* Only print if first char is printable ASCII, space, or common control */
+        if (first != '$' && (first >= 0x20 && first < 0x7F) || first == 0x0D || first == 0x0A || first == 0x09) {
+            int count = 0;
+            while (addr < MEM_SIZE && cpu->mem[addr] != '$' && count < 2000) {
+                cpu->al = cpu->mem[addr];
+                uint8_t save_ah = cpu->ah;
+                cpu->ah = 0x0E;
+                bios_int10(cpu);
+                cpu->ah = save_ah;
+                addr++;
+                count++;
+            }
         }
         break;
     }
@@ -287,34 +300,94 @@ void dos_int21(CPU *cpu)
             if (handle >= 0) {
                 cpu->ax = (uint16_t)handle;
                 cpu->flags &= ~FLAG_CF;
+                fprintf(stderr, "[FILE] Open '%s' -> handle %d\n", path, handle);
             } else {
                 fclose(f);
                 cpu->ax = 4;
                 cpu->flags |= FLAG_CF;
+                fprintf(stderr, "[FILE] Open '%s' FAIL (no handles)\n", path);
             }
         } else {
             cpu->ax = 2;  /* File not found */
             cpu->flags |= FLAG_CF;
+            fprintf(stderr, "[FILE] Open '%s' FAIL (not found) DS:DX=%04X:%04X raw=",
+                    path, cpu->ds, cpu->dx);
+            for (int j = 0; j < 16; j++)
+                fprintf(stderr, "%02X ", cpu->mem[seg_off(cpu->ds, (uint16_t)(cpu->dx + j))]);
+            fprintf(stderr, "\n");
         }
         break;
     }
 
     case 0x3E: { /* Close file */
+        fprintf(stderr, "[FILE] Close handle %d\n", cpu->bx);
         dos_close_handle(cpu->bx);
         cpu->flags &= ~FLAG_CF;
         break;
     }
 
     case 0x3F: { /* Read file */
-        FILE *f = dos_get_file(cpu->bx);
-        if (f) {
+        if (cpu->bx == 0) {
+            /* Handle 0 = stdin (CON device).
+             * Non-blocking: return any available keyboard input, or 0 (EOF).
+             * This handles both intentional stdin reads and corrupted FILE
+             * structs that default to handle 0. */
             uint32_t dest = seg_off(cpu->ds, cpu->dx);
-            size_t n = fread(cpu->mem + dest, 1, cpu->cx, f);
-            cpu->ax = (uint16_t)n;
+            uint16_t count = cpu->cx;
+            uint16_t got = 0;
+            /* Pump events so keys can arrive */
+            if (g_dos->poll_events)
+                g_dos->poll_events(g_dos->platform_ctx, g_dos, cpu);
+            while (got < count && keyboard_available(&g_dos->keyboard)) {
+                uint16_t key = keyboard_read(&g_dos->keyboard);
+                uint8_t ascii = (uint8_t)(key & 0xFF);
+                if (ascii == 0) continue;  /* skip extended keys */
+                cpu->mem[dest + got] = ascii;
+                got++;
+                if (ascii == 0x0D) break;
+            }
+            cpu->ax = got;
             cpu->flags &= ~FLAG_CF;
+            { static int _rc0 = 0; _rc0++;
+              if (_rc0 <= 10) fprintf(stderr, "[FILE] Read stdin %u bytes -> %u\n", count, got);
+              if (_rc0 == 1) {
+                  /* Dump VGA text mode buffer and key DS variables on first stdin read */
+                  fprintf(stderr, "[DIAG] VGA text at first stdin read:\n");
+                  for (int row = 0; row < 25; row++) {
+                      char line[81];
+                      int any_nonspace = 0;
+                      for (int col = 0; col < 80; col++) {
+                          uint8_t ch = cpu->mem[0xB8000 + row * 160 + col * 2];
+                          line[col] = (ch >= 32 && ch < 127) ? (char)ch : '.';
+                          if (ch > 32 && ch < 127) any_nonspace = 1;
+                      }
+                      line[80] = 0;
+                      if (any_nonspace) fprintf(stderr, "[VGA] %02d: %s\n", row, line);
+                  }
+                  /* Dump key DS offsets */
+                  fprintf(stderr, "[DIAG] DS:0x0098=[%04X] DS:0xAA=[%04X] DS:0x6AC2=[%04X]\n",
+                      mem_read16(cpu, cpu->ds, 0x0098),
+                      mem_read16(cpu, cpu->ds, 0x00AA),
+                      mem_read16(cpu, cpu->ds, 0x6AC2));
+                  fprintf(stderr, "[DIAG] video mode=0x%02X SP=%04X BP=%04X\n",
+                      cpu->mem[0x449], cpu->sp, cpu->bp);
+              }
+            }
         } else {
-            cpu->ax = 6;  /* Invalid handle */
-            cpu->flags |= FLAG_CF;
+            FILE *f = dos_get_file(cpu->bx);
+            if (f) {
+                uint32_t dest = seg_off(cpu->ds, cpu->dx);
+                size_t n = fread(cpu->mem + dest, 1, cpu->cx, f);
+                cpu->ax = (uint16_t)n;
+                cpu->flags &= ~FLAG_CF;
+                { static int _rc = 0; _rc++;
+                  if (_rc <= 20 || n == 0) fprintf(stderr, "[FILE] Read h=%d %u bytes -> %zu (call #%d)\n", cpu->bx, cpu->cx, n, _rc);
+                }
+            } else {
+                cpu->ax = 6;  /* Invalid handle */
+                cpu->flags |= FLAG_CF;
+                fprintf(stderr, "[FILE] Read h=%d FAIL (invalid)\n", cpu->bx);
+            }
         }
         break;
     }
@@ -387,12 +460,29 @@ void dos_int21(CPU *cpu)
         uint16_t paras = cpu->bx;
         if (g_dos->mem_top + paras < 0xA000) {
             cpu->ax = g_dos->mem_top;
+            fprintf(stderr, "[DOS] Alloc %u paras (%u bytes) -> seg 0x%04X\n",
+                    paras, (unsigned)paras * 16, cpu->ax);
             g_dos->mem_top += paras;
             cpu->flags &= ~FLAG_CF;
         } else {
             cpu->ax = 8;  /* Insufficient memory */
             cpu->bx = (uint16_t)(0xA000 - g_dos->mem_top);
+            fprintf(stderr, "[DOS] Alloc FAIL: %u paras requested, %u available\n",
+                    paras, cpu->bx);
             cpu->flags |= FLAG_CF;
+        }
+        break;
+    }
+
+    case 0x43: { /* Get/Set file attributes */
+        if (cpu->al == 0x00) {
+            /* Get file attributes: DS:DX = filename */
+            /* Return CX = normal file attributes */
+            cpu->cx = 0x0020; /* Archive bit set (normal file) */
+            cpu->flags &= ~FLAG_CF;
+        } else {
+            /* Set file attributes - just succeed */
+            cpu->flags &= ~FLAG_CF;
         }
         break;
     }
@@ -407,6 +497,43 @@ void dos_int21(CPU *cpu)
         cpu->flags &= ~FLAG_CF;  /* Always succeed */
         break;
 
+    case 0x44: { /* IOCTL - Get/Set device information */
+        uint8_t al = cpu->al;
+        switch (al) {
+        case 0x00: /* Get device information */
+            if (cpu->bx <= 4) {
+                /* Standard handles 0-4 are character devices */
+                /* Bit 7 = is device, Bit 0 = stdin, Bit 1 = stdout/stderr */
+                uint16_t info = 0x80; /* is device */
+                if (cpu->bx == 0) info |= 0x01;  /* stdin */
+                if (cpu->bx == 1 || cpu->bx == 2) info |= 0x02; /* stdout/stderr */
+                cpu->dx = info;
+                cpu->flags &= ~FLAG_CF;
+            } else {
+                /* File handle - return disk file info */
+                cpu->dx = 0x0000; /* disk file, drive A (bits 5-0) */
+                cpu->flags &= ~FLAG_CF;
+            }
+            break;
+        case 0x01: /* Set device information */
+            cpu->flags &= ~FLAG_CF; /* just succeed */
+            break;
+        case 0x06: /* Get input status */
+            cpu->al = 0xFF; /* ready */
+            cpu->flags &= ~FLAG_CF;
+            break;
+        case 0x07: /* Get output status */
+            cpu->al = 0xFF; /* ready */
+            cpu->flags &= ~FLAG_CF;
+            break;
+        default:
+            fprintf(stderr, "[DOS] Unhandled IOCTL sub-function AL=%02Xh BX=%04Xh\n", al, cpu->bx);
+            cpu->flags &= ~FLAG_CF;
+            break;
+        }
+        break;
+    }
+
     case 0x4C: /* Terminate with return code */
         printf("[DOS] Program exit with code %d\n", cpu->al);
         cpu->halted = 1;
@@ -417,7 +544,8 @@ void dos_int21(CPU *cpu)
         break;
 
     default:
-        fprintf(stderr, "[DOS] Unhandled INT 21h AH=%02Xh\n", ah);
+        fprintf(stderr, "[DOS] Unhandled INT 21h AH=%02Xh AL=%02Xh BX=%04Xh CX=%04Xh DX=%04Xh\n",
+                ah, cpu->al, cpu->bx, cpu->cx, cpu->dx);
         break;
     }
 }
@@ -433,14 +561,20 @@ void bios_int10(CPU *cpu)
 {
     switch (cpu->ah) {
     case 0x00: /* Set video mode */
+        fprintf(stderr, "[VIDEO] Set mode 0x%02X\n", cpu->al);
         /* Store current mode in BIOS data area */
         mem_write8(cpu, 0x0040, 0x0049, cpu->al);
         if (cpu->al == 0x13) {
             /* Mode 13h: 320x200x256 - clear VGA framebuffer */
             memset(&cpu->mem[0xA0000], 0, 64000);
-        } else if (cpu->al == 0x03) {
-            /* Mode 3: 80x25 text - clear text mode buffer */
+            mem_write16(cpu, 0x0040, 0x004A, 40);
+        } else if (cpu->al <= 0x03) {
+            /* Text mode - clear text mode buffer */
             memset(&cpu->mem[TEXT_MODE_BASE], 0, TEXT_COLS * TEXT_ROWS * 2);
+            mem_write16(cpu, 0x0040, 0x004A, 80);
+            /* Reset cursor to top-left */
+            mem_write8(cpu, 0x0040, 0x0050, 0);
+            mem_write8(cpu, 0x0040, 0x0051, 0);
         }
         break;
 
@@ -521,12 +655,13 @@ void bios_int16(CPU *cpu)
     switch (cpu->ah) {
     case 0x00: /* Read key (blocking) */
     case 0x10: /* Extended read key */
-        /* Block until a key is available, pumping the event loop */
+        fprintf(stderr, "[BLOCK] Waiting for key in INT 16h/%02Xh\n", cpu->ah);
         while (!keyboard_available(ks)) {
             if (g_dos->poll_events)
                 g_dos->poll_events(g_dos->platform_ctx, g_dos, cpu);
         }
         cpu->ax = keyboard_read(ks);
+        fprintf(stderr, "[KEY] INT 16h/%02Xh: 0x%04X\n", cpu->ah, cpu->ax);
         break;
 
     case 0x01: /* Check for key */
@@ -608,6 +743,10 @@ void mouse_int33(CPU *cpu)
 
 void int_handler(CPU *cpu, uint8_t num)
 {
+    static uint64_t call_count = 0;
+    call_count++;
+    if (call_count <= 3 || (call_count % 5000) == 0)
+        fprintf(stderr, "[INT] #%llu int=0x%02X\n", (unsigned long long)call_count, num);
     switch (num) {
     case 0x08: /* Timer tick - update timer state */
         timer_update(&g_dos->timer, 0);  /* Will use SDL tick in main loop */
@@ -627,6 +766,11 @@ void int_handler(CPU *cpu, uint8_t num)
 
 void port_out8(CPU *cpu, uint16_t port, uint8_t value)
 {
+    static uint64_t call_count = 0;
+    call_count++;
+    if (call_count <= 3 || (call_count % 10000) == 0)
+        fprintf(stderr, "[PORT] out8 #%llu port=0x%04X val=0x%02X\n",
+                (unsigned long long)call_count, port, value);
     DosState *ds = g_dos;
 
     /* VGA DAC palette ports */
@@ -652,6 +796,11 @@ void port_out8(CPU *cpu, uint16_t port, uint8_t value)
 
 uint8_t port_in8(CPU *cpu, uint16_t port)
 {
+    static uint64_t call_count = 0;
+    call_count++;
+    if (call_count <= 3 || (call_count % 10000) == 0)
+        fprintf(stderr, "[PORT] in8 #%llu port=0x%04X\n",
+                (unsigned long long)call_count, port);
     DosState *ds = g_dos;
 
     /* VGA status register */

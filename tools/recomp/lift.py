@@ -413,6 +413,13 @@ class Lifter:
                 if target in self.valid_addrs:
                     self.labels_needed.add(target)
                     self._emit(f'goto {_label(target, self.func_name)};', orig)
+                elif target < 0:
+                    # Negative target = jump to shared epilogue before function start.
+                    # MSC 5.x shared epilogues do: mov sp,bp; pop bp; ret/retf
+                    # The mov sp,bp unwinds all local vars and pushed regs.
+                    ret_sz = 4 if self.is_far else 2
+                    self._emit(f'cpu->sp = (uint16_t)(cpu->bp); cpu->bp = (uint16_t)(pop16(cpu)); cpu->sp += {ret_sz}; return;',
+                               f'shared epilogue ({orig})')
                 else:
                     self._emit(f'/* jmp out of function to 0x{target:06X} */', orig)
             elif op1 and op1.type == OpType.MEM:
@@ -686,6 +693,7 @@ class Lifter:
         self.func_calls = set()
         self.ovl_calls = set()
         self.func_name = name
+        self.is_far = is_far
         self.indent = 1
 
         # Build set of valid instruction addresses for this function

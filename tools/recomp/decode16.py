@@ -337,7 +337,7 @@ class Decoder:
                         'js','jns','jp','jnp','jl','jge','jle','jg']
             inst.mnemonic = CC_NAMES[opcode - 0x70]
             rel = self._s8()
-            target = (self.pos + rel) & 0xFFFF
+            target = self.pos + rel
             inst.op1 = Operand(type=OpType.REL8, disp=target, size=2)
 
         # Group 1: ALU r/m, imm
@@ -611,19 +611,19 @@ class Decoder:
         elif opcode == 0xE0:
             inst.mnemonic = 'loopnz'
             rel = self._s8()
-            inst.op1 = Operand(type=OpType.REL8, disp=(self.pos + rel) & 0xFFFF, size=2)
+            inst.op1 = Operand(type=OpType.REL8, disp=self.pos + rel, size=2)
         elif opcode == 0xE1:
             inst.mnemonic = 'loopz'
             rel = self._s8()
-            inst.op1 = Operand(type=OpType.REL8, disp=(self.pos + rel) & 0xFFFF, size=2)
+            inst.op1 = Operand(type=OpType.REL8, disp=self.pos + rel, size=2)
         elif opcode == 0xE2:
             inst.mnemonic = 'loop'
             rel = self._s8()
-            inst.op1 = Operand(type=OpType.REL8, disp=(self.pos + rel) & 0xFFFF, size=2)
+            inst.op1 = Operand(type=OpType.REL8, disp=self.pos + rel, size=2)
         elif opcode == 0xE3:
             inst.mnemonic = 'jcxz'
             rel = self._s8()
-            inst.op1 = Operand(type=OpType.REL8, disp=(self.pos + rel) & 0xFFFF, size=2)
+            inst.op1 = Operand(type=OpType.REL8, disp=self.pos + rel, size=2)
 
         # IN AL/AX, imm8
         elif opcode == 0xE4:
@@ -648,14 +648,14 @@ class Decoder:
         # CALL rel16
         elif opcode == 0xE8:
             rel = self._s16()
-            target = (self.pos + rel) & 0xFFFF
+            target = self.pos + rel  # offset relative to function start (no 16-bit mask)
             inst.mnemonic = 'call'
             inst.op1 = Operand(type=OpType.REL16, disp=target, size=2)
 
         # JMP rel16
         elif opcode == 0xE9:
             rel = self._s16()
-            target = (self.pos + rel) & 0xFFFF
+            target = self.pos + rel  # offset relative to function start (no 16-bit mask)
             inst.mnemonic = 'jmp'
             inst.op1 = Operand(type=OpType.REL16, disp=target, size=2)
 
@@ -669,7 +669,7 @@ class Decoder:
         # JMP rel8
         elif opcode == 0xEB:
             rel = self._s8()
-            target = (self.pos + rel) & 0xFFFF
+            target = self.pos + rel
             inst.mnemonic = 'jmp'
             inst.op1 = Operand(type=OpType.REL8, disp=target, size=2)
 

@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Pull in the recompiled function declarations */
 #include "civ_recomp.h"
@@ -32,6 +33,10 @@ static void game_poll_callback(void *platform_ctx, void *dos_state, const void *
 
     platform_poll_events(plat, dos);
     platform_render(plat, c, dos);
+
+    /* Keep timer advancing during blocking I/O waits */
+    timer_update(&dos->timer, (uint64_t)clock() * 1000ULL / CLOCKS_PER_SEC);
+
     platform_delay(1); /* Yield CPU to avoid 100% spin */
 }
 
@@ -90,13 +95,20 @@ static int load_exe_data(CPU *cpu, const char *exe_path)
     uint16_t init_cs = *(uint16_t *)(hdr + MZ_CS);
     uint16_t init_ip = *(uint16_t *)(hdr + MZ_IP);
 
-    /* Get total file size */
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
+    /* Calculate resident image size from MZ header page count.
+     * DOS only loads the resident image, NOT the overlay modules that
+     * follow it in the file.  Loading the full file would place overlay
+     * MZ headers into the DGROUP area and corrupt initialized data. */
+    uint16_t mz_last_page = *(uint16_t *)(hdr + 2);  /* bytes on last page */
+    uint16_t mz_pages     = *(uint16_t *)(hdr + 4);  /* pages in file */
+    long mz_image_total;
+    if (mz_last_page > 0)
+        mz_image_total = (long)(mz_pages - 1) * 512 + mz_last_page;
+    else
+        mz_image_total = (long)mz_pages * 512;
 
-    /* Load the entire code/data image (after MZ header) into flat memory */
     uint32_t load_addr = seg_off(LOAD_SEG, 0);
-    long image_size = file_size - hdr_size;
+    long image_size = mz_image_total - (long)hdr_size;
 
     if (load_addr + image_size > MEM_SIZE) {
         fprintf(stderr, "Error: EXE image too large (%ld bytes)\n", image_size);

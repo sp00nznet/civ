@@ -189,7 +189,10 @@ civ/
 │       ├── decode16.py          # 16-bit x86 instruction decoder
 │       ├── analyze.py           # Function boundary & call graph analyzer
 │       ├── lift.py              # x86-16 to C code lifter
-│       └── recomp.py            # Main recompilation driver
+│       ├── recomp.py            # Main recompilation driver
+│       ├── map_thunks.py        # Overlay thunk table decoder (EXEPACK + 7-byte entries)
+│       ├── map_thunks2.py       # Thunk caller analysis & cross-overlay constraint solver
+│       └── parse_overlays.py    # Overlay MZ header parser & function finder
 ├── include/                     # Public headers
 │   ├── recomp/
 │   │   ├── cpu.h                # CPU state struct (registers, flags, memory)
@@ -215,7 +218,9 @@ civ/
 └── RecompiledFuncs/             # Auto-generated C output (gitignored)
     ├── civ_recomp.h             # Master header (482 function declarations)
     ├── civ_recomp_000..009.c    # Recompiled game code (132K lines)
-    └── civ_stubs.c              # Stub functions for unresolved symbols
+    ├── civ_impl.c               # Hand-written implementations (tracked in git)
+    ├── civ_stubs.c              # Stub functions for unresolved symbols (auto-generated)
+    └── civ_aliases.c            # Overlay thunk aliases (auto-generated)
 ```
 
 ---
@@ -341,7 +346,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [x] Main entry point with frame-driven game loop
 - [x] **Full project compiles and links (zero errors, zero warnings)**
 
-### Phase 3 — Stub Resolution & Call Graph *(current)*
+### Phase 3 — Stub Resolution & Call Graph
 
 - [x] Traced MSC crt0 startup chain: `res_02A310` -> `ovl05_031396` (C main) -> `ovl21_048200` (game loop)
 - [x] Discovered CIV.EXE has **zero MZ relocations** — MSC overlay manager patches segments at runtime
@@ -350,21 +355,35 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [x] Stubs reduced from 553 -> 352 (36% reduction)
 - [x] Stub resolver tool (`resolve_stubs.py`) — maps unresolved names to existing functions
 - [x] Alias file (`civ_aliases.c`) — 79 wrapper functions for overlay/resident name mismatches
-- [ ] Resolve remaining 352 stubs (overlay dispatch table entries, MSC C library)
-- [ ] MSC overlay dispatch table mapping (7-byte thunk entries at seg 0000)
-- [ ] Detect 23 additional functions with standard prologues missed by analyzer
-- [ ] Game state initialization (replicate `__astart` at DS:0032)
 
-**Build Output:**
-```
-  civ.exe           22 KB     Main executable
-  civ_recomp.lib    6.0 MB    Recompiled game code (482 functions + 352 stubs)
-  civ_hal.lib       36 KB     HAL + DOS compatibility
-  civ_platform.lib  13 KB     SDL2 platform layer
-  SDL2.dll          1.6 MB    SDL2 runtime
-```
+### Phase 4 — Call Stack & Runtime Fixes
 
-### Phase 4 — Game Data & Audio HAL
+- [x] Call stack return address simulation (NEAR: push 0 + sp+=2, FAR: push CS + push 0 + sp+=4)
+- [x] INT 10h rewrite (text mode cursor, mode get/set, character output)
+- [x] Text mode VGA rendering (0xB8000 write-through, 80x25 cell display)
+- [x] VGA mode detection (port 3DA status register emulation)
+- [x] BIOS data area setup (cursor position at 0040:0050, tick counter at 0040:006C)
+
+### Phase 5 — EXEPACK & Overlay Runtime *(current)*
+
+- [x] EXEPACK decompression implemented (both in C runtime and Python analysis tools)
+- [x] Segment relocation applied after decompression (LOAD_SEG = 0x0100)
+- [x] DGROUP/BSS/stack initialization matching original crt0
+- [x] INT 3F inline overlay calls scanned (148 found in resident code)
+- [x] Title screen bypass (ovl02_02C200) -> "New Game" path
+- [x] Timer read (far_0000_0A40) -> BIOS tick counter from wall clock
+- [x] MSC 5.x heap allocator rewritten (correct free-list walking)
+- [x] Game reads king.txt successfully (4 fopen/fread/fclose cycles)
+- [x] Overlay thunk table structure decoded: 7-byte entries at offset 0x0761
+- [x] Thunk dual-mode design: JMP FAR (bytes 0-4) + CALL NEAR dispatcher (byte +5)
+- [x] Overlay function discovery: 155 functions across 23 modules (prologue scan + INT 3F)
+- [x] Cross-overlay caller constraint analysis for thunk mapping
+- [ ] Complete thunk-to-overlay-function mapping (64 active EA entries -> 155 overlay functions)
+- [ ] Fix far_0000_07DF infinite recursion (incorrect alias to ovl05_030C49)
+- [ ] VGA mode 13h activation (blocked by thunk mapping bug)
+- [ ] Remaining stub resolution
+
+### Phase 6 — Game Data & Audio HAL
 
 - [ ] .PIC image loader (native format support)
 - [ ] .PAL palette loader
@@ -372,7 +391,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [ ] .CV font renderer
 - [ ] SDL2 audio output (AdLib OPL2 synthesis or PCM playback)
 
-### Phase 5 — Integration & Testing
+### Phase 7 — Integration & Testing
 
 - [ ] Boot sequence (MicroProse logo → title screen)
 - [ ] Menu navigation (New Game / Load / Earth / Custom)
@@ -386,7 +405,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [ ] Save/load game state
 - [ ] Hall of Fame
 
-### Phase 5 — Polish & Enhancement
+### Phase 8 — Polish & Enhancement
 
 - [ ] Integer scaling (1x, 2x, 3x, 4x)
 - [ ] Windowed / fullscreen toggle
