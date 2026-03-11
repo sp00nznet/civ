@@ -364,7 +364,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [x] VGA mode detection (port 3DA status register emulation)
 - [x] BIOS data area setup (cursor position at 0040:0050, tick counter at 0040:006C)
 
-### Phase 5 — EXEPACK & Overlay Runtime *(current)*
+### Phase 5 — EXEPACK & Overlay Runtime
 
 - [x] EXEPACK decompression implemented (both in C runtime and Python analysis tools)
 - [x] Segment relocation applied after decompression (LOAD_SEG = 0x0100)
@@ -378,12 +378,28 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [x] Thunk dual-mode design: JMP FAR (bytes 0-4) + CALL NEAR dispatcher (byte +5)
 - [x] Overlay function discovery: 155 functions across 23 modules (prologue scan + INT 3F)
 - [x] Cross-overlay caller constraint analysis for thunk mapping
+- [x] Fixed far_0000_07DF infinite recursion (corrected alias to ovl05_0307DA)
+- [x] LOMEM false alarm fixed (ovl02_02C200 returns AX=0x6000 for memory check)
+- [x] VGA mode 13h activation working
 - [ ] Complete thunk-to-overlay-function mapping (64 active EA entries -> 155 overlay functions)
-- [ ] Fix far_0000_07DF infinite recursion (incorrect alias to ovl05_030C49)
-- [ ] VGA mode 13h activation (blocked by thunk mapping bug)
 - [ ] Remaining stub resolution
 
-### Phase 6 — Game Data & Audio HAL
+### Phase 6 — World Generation *(current)*
+
+- [x] Terrain seed placement (ovl07_034D88) working
+- [x] Terrain growth scan loop working
+- [x] Jump Table 1 (terrain type assignment, 8 climate cases) reconstructed from binary
+- [x] Jump Table 2 (terrain feature placement, 14 cases) reconstructed from binary
+- [x] Continent placement (ovl07_034A5C) working — finds ocean tiles correctly
+- [x] Terrain detail pass (ovl07_034E33) working
+- [x] World generation animation (ovl07_035B6E) running — progresses through phases
+- [x] Timer speed multiplier (20x) for faster animation playback
+- [ ] Animation completion — loop has hundreds of phases, needs optimization or skip
+- [ ] far_0000_07ED (blit function) — stub, needs implementation for rendering
+- [ ] far_205A_2AC0 (climate/temperature) — returns 0, causes uniform terrain
+- [ ] far_1B05_131A / far_1B05_182A — heavily called map display functions (stubs)
+
+### Phase 7 — Game Data & Audio HAL
 
 - [ ] .PIC image loader (native format support)
 - [ ] .PAL palette loader
@@ -391,7 +407,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [ ] .CV font renderer
 - [ ] SDL2 audio output (AdLib OPL2 synthesis or PCM playback)
 
-### Phase 7 — Integration & Testing
+### Phase 8 — Integration & Testing
 
 - [ ] Boot sequence (MicroProse logo → title screen)
 - [ ] Menu navigation (New Game / Load / Earth / Custom)
@@ -405,7 +421,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [ ] Save/load game state
 - [ ] Hall of Fame
 
-### Phase 8 — Polish & Enhancement
+### Phase 9 — Polish & Enhancement
 
 - [ ] Integer scaling (1x, 2x, 3x, 4x)
 - [ ] Windowed / fullscreen toggle

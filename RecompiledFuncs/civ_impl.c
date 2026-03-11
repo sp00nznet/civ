@@ -67,12 +67,6 @@ void far_205A_2096(CPU *cpu)
     if (dos->poll_events)
         dos->poll_events(dos->platform_ctx, dos, cpu);
     cpu->ax = keyboard_available(&dos->keyboard) ? 0x00FF : 0x0000;
-    /* Auto-advance: simulate keypress when no real key available.
-     * This lets the game progress past "press any key" screens in testing. */
-    if (cpu->ax == 0) {
-        keyboard_push(&dos->keyboard, 0x1C, 0x0D); /* inject Enter key */
-        cpu->ax = 0x00FF;
-    }
     if (call_count <= 5 || (call_count % 500) == 0) {
         fprintf(stderr, "[KBHIT] #%llu result=%u\n",
                 (unsigned long long)call_count, cpu->ax);
@@ -330,6 +324,22 @@ void far_0000_0BEC(CPU *cpu)
         fprintf(stderr, "[FILL] #%llu gfx=DS:%04X x=%d y=%d w=%d h=%d color=%d\n",
                 (unsigned long long)call_count, gfx_ptr, x, y, width, height, color);
     }
+    /* Dump game state on first few minimap fills to diagnose the loop */
+    if (x == 160 && y == 0 && width == 80 && height == 50) {
+        static int minimap_count = 0;
+        minimap_count++;
+        if (minimap_count <= 5 || minimap_count == 100 || minimap_count == 1000) {
+            fprintf(stderr, "[DIAG] minimap_fill #%d: EB78=%04X 6B1A=%04X E71E=%04X 9102=%04X EE90=%04X sp=%04X\n",
+                    minimap_count,
+                    mem_read16(cpu, cpu->ds, 0xEB78),
+                    mem_read16(cpu, cpu->ds, 0x6B1A),
+                    mem_read16(cpu, cpu->ds, 0xE71E),
+                    mem_read16(cpu, cpu->ds, 0x9102),
+                    mem_read16(cpu, cpu->ds, 0xEE90),
+                    cpu->sp);
+            fflush(stderr);
+        }
+    }
 
     /* Early out: nothing to draw */
     if (width <= 0 || height <= 0) {
@@ -389,6 +399,9 @@ void far_0000_0838(CPU *cpu)
     cpu->sp += 4; /* far ret */
 }
 
+/* Timer speed multiplier - speeds up animation during world gen */
+static int timer_speed = 20;
+
 /* ─── Game timer: save/read ─── */
 /* far_0000_0330 - Save current timer tick count (start a delay measurement).
  * Used by delay loops (res_001932): saves the current tick count so that
@@ -402,13 +415,13 @@ void far_0000_0330(CPU *cpu)
 
     DosState *dos = get_dos_state(cpu);
 
-    /* Update timer with real wall-clock time */
-    uint64_t ms = (uint64_t)clock() * 1000ULL / CLOCKS_PER_SEC;
+    /* Update timer with real wall-clock time (scaled by speed multiplier) */
+    uint64_t ms = (uint64_t)clock() * 1000ULL / CLOCKS_PER_SEC * timer_speed;
     timer_update(&dos->timer, ms);
 
     delay_start_ticks = timer_get_ticks(&dos->timer);
     if (call_count <= 5) {
-        fprintf(stderr, "[TIMER] save #%d tick=%u\n", call_count, delay_start_ticks);
+        fprintf(stderr, "[TIMER] save #%d tick=%u (speed=%dx)\n", call_count, delay_start_ticks, timer_speed);
         fflush(stderr);
     }
     cpu->sp += 4; /* far ret */
@@ -428,8 +441,8 @@ void far_0000_032C(CPU *cpu)
     if (dos->poll_events)
         dos->poll_events(dos->platform_ctx, dos, cpu);
 
-    /* Update timer with real wall-clock time */
-    uint64_t ms = (uint64_t)clock() * 1000ULL / CLOCKS_PER_SEC;
+    /* Update timer with real wall-clock time (scaled by speed multiplier) */
+    uint64_t ms = (uint64_t)clock() * 1000ULL / CLOCKS_PER_SEC * timer_speed;
     timer_update(&dos->timer, ms);
 
     uint32_t now = timer_get_ticks(&dos->timer);
@@ -454,8 +467,8 @@ void far_0000_0A40(CPU *cpu)
 {
     DosState *dos = get_dos_state(cpu);
 
-    /* Update timer from wall-clock time */
-    uint64_t ms = (uint64_t)clock() * 1000ULL / CLOCKS_PER_SEC;
+    /* Update timer from wall-clock time (scaled by speed multiplier) */
+    uint64_t ms = (uint64_t)clock() * 1000ULL / CLOCKS_PER_SEC * timer_speed;
     timer_update(&dos->timer, ms);
 
     uint32_t ticks = timer_get_ticks(&dos->timer);
@@ -1216,6 +1229,153 @@ void ovl02_02C200(CPU *cpu)
 
     /* Not earth mode */
     mem_write16(cpu, cpu->ds, 0xC13E, 0x0000);
+
+    /* Return "available paragraphs" in AX.
+     * The caller (res_001A66) checks AX against a threshold of 0xFA0 (4000
+     * paragraphs) to decide if there's enough memory. If AX < threshold,
+     * the game shows the *LOMEM error from king.txt and hangs. */
+    cpu->ax = 0x6000;  /* 24576 paragraphs = ~384 KB free */
+
+    cpu->sp += 4; /* far ret */
+}
+
+/* ─── Random number module (overlay segment 0x1DDE) ─── */
+/*
+ * The 1DDE overlay contains the game's random number generator.
+ * MSC 5.x uses: seed = seed * 214013 + 2531011; return (seed>>16) & 0x7FFF
+ * We use the same LCG for reproducibility.
+ */
+static uint32_t rng_seed = 0;
+static int rng_seeded = 0;
+
+static uint16_t civ_rand(void)
+{
+    if (!rng_seeded) {
+        rng_seed = (uint32_t)time(NULL);
+        rng_seeded = 1;
+    }
+    rng_seed = rng_seed * 214013u + 2531011u;
+    return (uint16_t)((rng_seed >> 16) & 0x7FFF);
+}
+
+/* far_1DDE_0042 - srand(seed): Seed the random number generator.
+ * Stack: [ret4] [seed 2 bytes] */
+void far_1DDE_0042(CPU *cpu)
+{
+    uint16_t seed = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
+    rng_seed = (uint32_t)seed;
+    rng_seeded = 1;
+    fprintf(stderr, "[RNG] srand(%u)\n", seed);
+    cpu->sp += 4; /* far ret */
+}
+
+/* far_1DDE_005D - random(max): Return random int in [0, max).
+ * Stack: [ret4] [max 2 bytes]
+ * Returns: AX = random value in [0, max) */
+void far_1DDE_005D(CPU *cpu)
+{
+    uint16_t max_val = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
+    if (max_val == 0) {
+        cpu->ax = 0;
+    } else {
+        cpu->ax = civ_rand() % max_val;
+    }
+    cpu->sp += 4; /* far ret */
+}
+
+/* ─── Map access thunks (overlay segment 0x1B05 / thunk 0x07C3) ─── */
+
+/* far_0000_07C3 - Map terrain query (thunk table entry #14).
+ * Stack: [ret4] [layer 2] [col 2] [row 2]
+ * Returns: AX = terrain value at (col, row) for given layer.
+ *
+ * From res_00AB99 call analysis: arg1=layer, arg2=col, arg3=row.
+ * The map is 80 columns x 50 rows, wrapping E-W. Data stored at DS offsets
+ * organized by layer. Return the byte from the map data array. */
+void far_0000_07C3(CPU *cpu)
+{
+    static int call_count = 0;
+    call_count++;
+
+    uint16_t arg1 = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
+    uint16_t arg2 = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 6));
+    uint16_t arg3 = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 8));
+
+    if (call_count <= 10) {
+        fprintf(stderr, "[MAP_Q] far_0000_07C3 #%d args=(%u, %u, %u)\n",
+                call_count, arg1, arg2, arg3);
+        fflush(stderr);
+    }
+
+    uint16_t layer = arg1;
+    uint16_t col = arg2 % 80;  /* E-W wrap */
+    uint16_t row = arg3;
+
+    /* Map data: 80 columns x 50 rows, 6 layers.
+     * Base offsets per layer (from code analysis):
+     *   Layer 0: DS:0x5864 (terrain type)
+     *   Layer 1: DS:0x6824 (terrain modifiers)
+     *   Layer 2: DS:0x77E4 (visibility/ownership)
+     * Each layer = 80*50 = 4000 bytes */
+    if (row < 50 && layer < 6) {
+        uint16_t base;
+        switch (layer) {
+        case 0: base = 0x5864; break;
+        case 1: base = 0x6824; break;
+        case 2: base = 0x77E4; break;
+        case 3: base = 0x87A4; break;
+        case 4: base = 0x9764; break;
+        case 5: base = 0xA724; break;
+        default: base = 0x5864; break;
+        }
+        uint16_t offset = base + row * 80 + col;
+        cpu->ax = (uint16_t)mem_read8(cpu, cpu->ds, offset);
+    } else {
+        cpu->ax = 0;
+    }
+
+    cpu->sp += 4; /* far ret */
+}
+
+/* far_1B05_17C3 - Map terrain write.
+ * Stack: [ret4] [arg1 2] [arg2 2] [arg3 2] [arg4 2]
+ * Writes a value to the map at given coordinates and layer. */
+void far_1B05_17C3(CPU *cpu)
+{
+    static int call_count = 0;
+    call_count++;
+
+    uint16_t arg1 = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
+    uint16_t arg2 = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 6));
+    uint16_t arg3 = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 8));
+    uint16_t arg4 = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 10));
+
+    if (call_count <= 10) {
+        fprintf(stderr, "[MAP_W] far_1B05_17C3 #%d args=(%u, %u, %u, %u)\n",
+                call_count, arg1, arg2, arg3, arg4);
+        fflush(stderr);
+    }
+
+    /* Write value to map: arg1=col, arg2=row, arg3=value, arg4=layer */
+    uint16_t col = arg1 % 80;  /* E-W wrap */
+    uint16_t row = arg2;
+    uint16_t value = arg3;
+    uint16_t layer = arg4;
+
+    if (row < 50 && layer < 6) {
+        uint16_t base;
+        switch (layer) {
+        case 0: base = 0x5864; break;
+        case 1: base = 0x6824; break;
+        case 2: base = 0x77E4; break;
+        case 3: base = 0x87A4; break;
+        case 4: base = 0x9764; break;
+        case 5: base = 0xA724; break;
+        default: base = 0x5864; break;
+        }
+        uint16_t offset = base + row * 80 + col;
+        mem_write8(cpu, cpu->ds, offset, (uint8_t)(value & 0xFF));
+    }
 
     cpu->sp += 4; /* far ret */
 }

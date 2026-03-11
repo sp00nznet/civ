@@ -818,6 +818,15 @@ uint8_t port_in8(CPU *cpu, uint16_t port)
         return timer_port_read(&ds->timer, port);
     }
 
+    /* DMA channel word count registers (0x01, 0x03, 0x05, 0x07) */
+    /* Port 0x0004 is not a standard DMA port but CIV.EXE reads it in a
+     * timing loop, expecting the value to change.  Return a fast-moving
+     * counter so the loop exits quickly. */
+    if (port <= 0x07 || port == 0x0004) {
+        static uint8_t dma_counter = 0;
+        return dma_counter++;
+    }
+
     /* Keyboard data port */
     if (port == 0x60) {
         return 0;  /* No key */
