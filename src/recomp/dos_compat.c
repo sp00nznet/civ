@@ -766,11 +766,6 @@ void int_handler(CPU *cpu, uint8_t num)
 
 void port_out8(CPU *cpu, uint16_t port, uint8_t value)
 {
-    static uint64_t call_count = 0;
-    call_count++;
-    if (call_count <= 3 || (call_count % 10000) == 0)
-        fprintf(stderr, "[PORT] out8 #%llu port=0x%04X val=0x%02X\n",
-                (unsigned long long)call_count, port, value);
     DosState *ds = g_dos;
 
     /* VGA DAC palette ports */
@@ -796,11 +791,6 @@ void port_out8(CPU *cpu, uint16_t port, uint8_t value)
 
 uint8_t port_in8(CPU *cpu, uint16_t port)
 {
-    static uint64_t call_count = 0;
-    call_count++;
-    if (call_count <= 3 || (call_count % 10000) == 0)
-        fprintf(stderr, "[PORT] in8 #%llu port=0x%04X\n",
-                (unsigned long long)call_count, port);
     DosState *ds = g_dos;
 
     /* VGA status register */

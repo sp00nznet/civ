@@ -117,9 +117,6 @@ void far_01A7_0252(CPU *cpu)
 {
     static int call_count = 0;
     call_count++;
-    if (call_count <= 5 || (call_count % 100) == 0)
-        fprintf(stderr, "[FRAME] end_frame #%d\n", call_count);
-
     uint16_t gfx_ptr = mem_read16(cpu, cpu->ds, 0xAA);
     uint16_t page = mem_read16(cpu, cpu->ds, gfx_ptr); /* struct[+00] page flag */
     if (page != 0) {
@@ -127,6 +124,16 @@ void far_01A7_0252(CPU *cpu)
         if (src + 64000 <= MEM_SIZE) {
             memcpy(&cpu->mem[0xA0000], &cpu->mem[src], 64000);
         }
+    }
+
+    if (call_count <= 5 || (call_count % 100) == 0) {
+        /* Scan VGA framebuffer for non-zero pixels */
+        int nonzero = 0;
+        for (int i = 0; i < 64000 && nonzero < 20; i++) {
+            if (cpu->mem[0xA0000 + i] != 0) nonzero++;
+        }
+        fprintf(stderr, "[FRAME] end_frame #%d page=%d gfx=%04X nonzero=%d\n",
+                call_count, page, gfx_ptr, nonzero);
     }
 
     /* Yield after rendering */
@@ -154,6 +161,19 @@ void far_085F_257B(CPU *cpu)
 {
     (void)cpu;
     cpu->sp += 4; /* far ret */
+}
+
+/* far_0000_0825 - Timer/VBlank interrupt handler.
+ * Original code: sets CS:[0x065A] = 1 and does IRET.
+ * This flag is polled by wait loops. In the recompiled version,
+ * we set the flag in memory at the relocated address.
+ * Pre-relocation CS=0, relocated CS=LOAD_SEG=0x100, so
+ * CS:0x065A = real address 0x100*16 + 0x065A = 0x165A. */
+void far_0000_0825(CPU *cpu)
+{
+    /* Set the timer/VBlank flag */
+    mem_write16(cpu, 0x0100, 0x065A, 1);
+    cpu->sp += 4; /* far ret (original uses IRET but we just return) */
 }
 
 /* far_0000_08B8 - Begin drawing / set clip rect.
@@ -377,6 +397,201 @@ void far_0000_0BEC(CPU *cpu)
             memset(&cpu->mem[row_addr], color, (size_t)(x2 - x1));
         }
     }
+    cpu->sp += 4; /* far ret */
+}
+
+/* ─── Blit: far_0000_07ED ─── */
+/* far_0000_07ED - Copy rectangle between GFX page buffers.
+ * Stack params (cdecl, caller cleans 0x10 = 16 bytes):
+ *   [sp+04] src_gfx  - DS offset to source GFX context struct
+ *   [sp+06] sx       - source x coordinate
+ *   [sp+08] sy       - source y coordinate
+ *   [sp+0A] width    - rectangle width in pixels
+ *   [sp+0C] height   - rectangle height in pixels
+ *   [sp+0E] dst_gfx  - DS offset to destination GFX context struct
+ *   [sp+10] dx       - destination x coordinate
+ *   [sp+12] dy       - destination y coordinate
+ *
+ * Both src_gfx and dst_gfx point to GFX structs with:
+ *   [+00] page (0=VGA, 1=page1, 2=page2)
+ *   [+02] x_origin
+ *   [+04] y_origin
+ */
+void far_0000_07ED(CPU *cpu)
+{
+    static uint64_t call_count = 0;
+    call_count++;
+
+    /* Yield periodically */
+    if (call_count % 50 == 0) {
+        DosState *dos = get_dos_state(cpu);
+        if (dos->poll_events)
+            dos->poll_events(dos->platform_ctx, dos, cpu);
+    }
+
+    uint16_t sp = (uint16_t)(cpu->sp + 4); /* skip far return address */
+    uint16_t src_gfx = mem_read16(cpu, cpu->ss, sp);
+    int16_t sx       = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 2));
+    int16_t sy       = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 4));
+    int16_t width    = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 6));
+    int16_t height   = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 8));
+    uint16_t dst_gfx = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 10));
+    int16_t dx       = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 12));
+    int16_t dy       = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 14));
+
+    if (call_count <= 10 || (call_count % 1000) == 0) {
+        uint16_t sp2 = mem_read16(cpu, cpu->ds, src_gfx);
+        uint16_t dp2 = mem_read16(cpu, cpu->ds, dst_gfx);
+        fprintf(stderr, "[BLIT] #%llu src=DS:%04X(pg%d,%d,%d) %dx%d -> dst=DS:%04X(pg%d,%d,%d)\n",
+                (unsigned long long)call_count, src_gfx, sp2, sx, sy, width, height, dst_gfx, dp2, dx, dy);
+        fflush(stderr);
+    }
+
+    if (width <= 0 || height <= 0) {
+        cpu->sp += 4; /* far ret */
+        return;
+    }
+
+    /* Read source GFX context */
+    uint16_t src_page     = mem_read16(cpu, cpu->ds, src_gfx);
+    int16_t  src_x_origin = (int16_t)mem_read16(cpu, cpu->ds, (uint16_t)(src_gfx + 2));
+    int16_t  src_y_origin = (int16_t)mem_read16(cpu, cpu->ds, (uint16_t)(src_gfx + 4));
+
+    /* Read destination GFX context */
+    uint16_t dst_page     = mem_read16(cpu, cpu->ds, dst_gfx);
+    int16_t  dst_x_origin = (int16_t)mem_read16(cpu, cpu->ds, (uint16_t)(dst_gfx + 2));
+    int16_t  dst_y_origin = (int16_t)mem_read16(cpu, cpu->ds, (uint16_t)(dst_gfx + 4));
+
+    /* Apply origin offsets */
+    sx += src_x_origin;
+    sy += src_y_origin;
+    dx += dst_x_origin;
+    dy += dst_y_origin;
+
+    uint32_t src_base = gfx_page_addr(src_page);
+    uint32_t dst_base = gfx_page_addr(dst_page);
+
+    /* Clip to screen bounds (320x200) */
+    int16_t src_x1 = sx, src_y1 = sy;
+    int16_t dst_x1 = dx, dst_y1 = dy;
+    int16_t copy_w = width, copy_h = height;
+
+    /* Clip left edge */
+    if (src_x1 < 0) { copy_w += src_x1; dst_x1 -= src_x1; src_x1 = 0; }
+    if (dst_x1 < 0) { copy_w += dst_x1; src_x1 -= dst_x1; dst_x1 = 0; }
+    /* Clip right edge */
+    if (src_x1 + copy_w > 320) copy_w = 320 - src_x1;
+    if (dst_x1 + copy_w > 320) copy_w = 320 - dst_x1;
+    /* Clip top edge */
+    if (src_y1 < 0) { copy_h += src_y1; dst_y1 -= src_y1; src_y1 = 0; }
+    if (dst_y1 < 0) { copy_h += dst_y1; src_y1 -= dst_y1; dst_y1 = 0; }
+    /* Clip bottom edge */
+    if (src_y1 + copy_h > 200) copy_h = 200 - src_y1;
+    if (dst_y1 + copy_h > 200) copy_h = 200 - dst_y1;
+
+    if (copy_w <= 0 || copy_h <= 0) {
+        cpu->sp += 4; /* far ret */
+        return;
+    }
+
+    /* Copy scanlines */
+    for (int row = 0; row < copy_h; row++) {
+        uint32_t s = src_base + (uint32_t)(src_y1 + row) * 320 + (uint32_t)src_x1;
+        uint32_t d = dst_base + (uint32_t)(dst_y1 + row) * 320 + (uint32_t)dst_x1;
+        if (s + copy_w <= MEM_SIZE && d + copy_w <= MEM_SIZE) {
+            memmove(&cpu->mem[d], &cpu->mem[s], (size_t)copy_w);
+        }
+    }
+
+    cpu->sp += 4; /* far ret */
+}
+
+/* ─── Animation skip: ovl07_035B6E ─── */
+/* ovl07_035B6E - World generation animation stepper.
+ * Original function is a complex state machine that animates terrain
+ * being revealed on screen over ~500 phases. We skip it entirely.
+ * Returns AX=0 to signal animation complete (0x3B12=2).
+ * The terrain data was already generated by earlier pipeline stages. */
+void ovl07_035B6E(CPU *cpu)
+{
+    static int call_count = 0;
+    call_count++;
+    if (call_count <= 5 || (call_count % 1000) == 0)
+        fprintf(stderr, "[ANIM_SKIP] ovl07_035B6E call #%d sp=%04X\n", call_count, cpu->sp);
+
+    /* Return AX=0 (no animation work to do) */
+    cpu->ax = 0;
+    cpu->sp += 4; /* far ret */
+}
+
+/* ─── File read: far_205A_30E4 ─── */
+/* far_205A_30E4 - DOS file read wrapper (_dos_read).
+ * Stack: [ret_addr 4] [handle 2] [buf_off 2] [buf_seg 2] [size 2] [result_ptr 2]
+ * Reads 'size' bytes from file 'handle' into buf_seg:buf_off.
+ * Stores bytes-read count at SS:result_ptr.
+ * Returns AX = bytes read (or 0 on error). */
+void far_205A_30E4(CPU *cpu)
+{
+    uint16_t sp = (uint16_t)(cpu->sp + 4);
+    uint16_t handle    = mem_read16(cpu, cpu->ss, sp);
+    uint16_t buf_off   = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 2));
+    uint16_t buf_seg   = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 4));
+    uint16_t size      = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 6));
+    uint16_t res_ptr   = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 8));
+
+    DosState *dos = get_dos_state(cpu);
+    uint16_t got = 0;
+
+    if (handle < DOS_MAX_HANDLES && dos->file_table.files[handle]) {
+        uint32_t dest = seg_off(buf_seg, buf_off);
+        if (dest + size <= MEM_SIZE) {
+            size_t n = fread(cpu->mem + dest, 1, size, dos->file_table.files[handle]);
+            got = (uint16_t)n;
+        }
+    }
+
+    /* Store result at SS:result_ptr */
+    mem_write16(cpu, cpu->ss, res_ptr, got);
+    cpu->ax = got;
+    cpu->sp += 4; /* far ret */
+}
+
+/* ─── Climate/temperature: far_205A_2AC0 ─── */
+/* far_205A_2AC0 - Returns abs(arg). Used in terrain type assignment to
+ * convert signed latitude offset to unsigned distance from equator.
+ * Stack: [ret_addr 4] [latitude 2]
+ * Returns AX = abs(latitude). */
+void far_205A_2AC0(CPU *cpu)
+{
+    uint16_t sp = (uint16_t)(cpu->sp + 4);
+    int16_t arg = (int16_t)mem_read16(cpu, cpu->ss, sp);
+    cpu->ax = (uint16_t)(arg < 0 ? -arg : arg);
+    cpu->sp += 4; /* far ret */
+}
+
+/* ─── Timer delay: far_1DDE_007C ─── */
+/* far_1DDE_007C - Animation timing/delay function.
+ * Stack: [ret_addr 4] [delay_target 2] [current_time 2] [max_time 2]
+ * Returns AX = next timing value. Used in animation loop timing.
+ * With animation skipped, this rarely gets called but we implement it
+ * to avoid issues if other code paths use it. */
+void far_1DDE_007C(CPU *cpu)
+{
+    uint16_t sp = (uint16_t)(cpu->sp + 4);
+    uint16_t arg1 = mem_read16(cpu, cpu->ss, sp);
+    uint16_t arg2 = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 2));
+    uint16_t arg3 = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 4));
+
+    static int call_count = 0;
+    call_count++;
+    if (call_count <= 5) {
+        fprintf(stderr, "[DELAY] far_1DDE_007C #%d args=(%u, %u, %u)\n",
+                call_count, arg1, arg2, arg3);
+        fflush(stderr);
+    }
+
+    /* Return the target time to indicate we've reached it */
+    cpu->ax = arg3;
     cpu->sp += 4; /* far ret */
 }
 
@@ -888,6 +1103,66 @@ void res_022181(CPU *cpu)
     cpu->sp += 2;
 }
 
+/* ─── Overlay manager init: res_000A54 ─── */
+/* res_000A54 - MSC overlay manager initialization.
+ * Original: allocates memory, loads overlay EXE via INT 21h/4Bh fn 03h,
+ * sets up the far heap descriptor at DS:0x53B8, and patches INT 3Fh thunks.
+ * In our recompilation all overlay code is compiled in, so we just allocate
+ * a memory block for the heap descriptor and return the segment.
+ *
+ * Stack (far call, cdecl, caller cleans 4 bytes):
+ *   [sp+04] filename_offset  (DS-relative pointer to overlay filename)
+ *   [sp+06] flags            (0 = don't call res_000AFC)
+ * Returns: AX = allocated segment.
+ */
+void res_000A54(CPU *cpu)
+{
+    /* Query available DOS memory */
+    cpu->ah = 0x48;
+    cpu->bx = 0xFFFF;
+    dos_int21(cpu);  /* CF set, BX = available paragraphs */
+
+    /* Allocate available - 0x100 paragraphs */
+    uint16_t alloc_size = cpu->bx - 0x100;
+    cpu->ah = 0x48;
+    cpu->bx = alloc_size;
+    dos_int21(cpu);  /* AX = segment, CF clear on success */
+    if (cpu->flags & FLAG_CF) {
+        fprintf(stderr, "[FATAL] res_000A54: memory allocation failed\n");
+        exit(1);
+    }
+
+    uint16_t seg = cpu->ax;
+    mem_write16(cpu, cpu->ds, 0x53BC, alloc_size);  /* store size */
+    mem_write16(cpu, cpu->ds, 0x53B8, seg);          /* heap base */
+    mem_write16(cpu, cpu->ds, 0x53BA, seg);          /* heap base copy */
+
+    /* Zero the overlay header area so res_000B4E reads safe values */
+    uint32_t base = (uint32_t)seg * 16;
+    for (int i = 0; i < 0x40 && base + i < MEM_SIZE; i++)
+        cpu->mem[base + i] = 0;
+
+    fprintf(stderr, "[RUNTIME] res_000A54: allocated %u paras at seg 0x%04X\n",
+            alloc_size, seg);
+
+    cpu->ax = seg;
+    cpu->sp += 4; /* far ret */
+}
+
+/* ─── Overlay thunk table init: res_000B4E ─── */
+/* res_000B4E - Patches INT 3Fh thunk table from loaded overlay header.
+ * In our recompilation overlay thunks are direct C function calls,
+ * so this is a no-op.
+ * Stack (far call, cdecl, caller cleans 2 bytes):
+ *   [sp+04] segment of loaded overlay
+ */
+void res_000B4E(CPU *cpu)
+{
+    (void)cpu;
+    fprintf(stderr, "[RUNTIME] res_000B4E (thunk table init) - skipped\n");
+    cpu->sp += 4; /* far ret */
+}
+
 /* ─── Overlay file loader ─── */
 /* res_000AFC - Overlay file loader (no-op in recompilation).
  * In the original binary, this loads overlay segments from CIV.EXE.
@@ -1036,9 +1311,13 @@ void far_205A_20C2(CPU *cpu)
             fprintf(stderr, "[DIALOG] result=%u (key=0x%04X ascii='%c')\n",
                     selection, key, (ascii >= 32 && ascii < 127) ? ascii : '.');
         } else {
-            /* No key available - auto-select option 1 */
-            mem_write16(cpu, cpu->ds, (uint16_t)(ctrl_off - 2), 1);
-            fprintf(stderr, "[DIALOG] auto-selected 1 (no key available)\n");
+            /* No key available - auto-select option 0 (New Game on main menu).
+             * The game's main menu maps: 0=New Game, 1=Load, 2=Scenario, etc.
+             * Previously stubs returned garbage AX which fell through to
+             * the new-game path; now that dialog code is real, we must
+             * explicitly select 0. */
+            mem_write16(cpu, cpu->ds, (uint16_t)(ctrl_off - 2), 0);
+            fprintf(stderr, "[DIALOG] auto-selected 0 (no key available)\n");
         }
     } else if (type == 0x10) {
         /* Display-only dialog (opts=0) - set result=0, don't block.
@@ -1378,4 +1657,319 @@ void far_1B05_17C3(CPU *cpu)
     }
 
     cpu->sp += 4; /* far ret */
+}
+
+/* ─── PIC LZW Decoder: internal subroutines of res_0011E6 ─── */
+/* These are internal near-call subroutines within the res_0011E6 code range
+ * (0x0011E6-0x0013A6). They implement LZW decompression for .PIC files.
+ *
+ * The decoder uses the emulated stack as a LIFO buffer for LZW-decompressed
+ * characters, switching between normal stack and decode stack via
+ * xchg sp, [0x687A].
+ *
+ * Data structures (all in DS segment):
+ *   0x6874: image width (pixels per row)
+ *   0x6876: image height (number of rows)
+ *   0x687A: saved SP for stack switching (decode stack at 0x6A8D)
+ *   0x687C: pixels remaining in current row
+ *   0x687E: RLE repeat count
+ *   0x687F: RLE repeat byte
+ *   0x6880: current LZW code bit width
+ *   0x6881: max LZW code bit width
+ *   0x6882: LZW max code value ((1 << bitwidth) - 1)
+ *   0x6884: next LZW dictionary entry index
+ *   0x6886: bit buffer (16-bit)
+ *   0x6888: bits remaining in bit buffer
+ *   0x6889: 4-bit mode flag (for EGA/CGA)
+ *   0x688A: previous LZW code
+ *   0x688C: first character of previous code
+ *   0xC19E: read position in compressed data buffer
+ *   0x54D8: end of compressed data buffer
+ *   0xE84A: callback to refill compressed data buffer
+ *   0xC936-: LZW dictionary area
+ *   DS-0x36CA: dictionary parent pointers (word, indexed by code*3)
+ *   DS-0x36C8: dictionary character values (byte, indexed by code*3)
+ */
+
+/* Forward declare callback function */
+extern void res_020191(CPU *cpu);
+
+/* Helper: refill the compressed data buffer via the E84A callback */
+static void pic_refill_buffer(CPU *cpu)
+{
+    push16(cpu, cpu->bx);
+    push16(cpu, cpu->cx);
+    push16(cpu, cpu->dx);
+    uint16_t cb_off = mem_read16(cpu, cpu->ds, 0xE84A);
+    uint16_t cb_seg = mem_read16(cpu, cpu->ds, 0xE84C);
+    if (cb_seg == 0x1FB6 && cb_off == 0x0642) {
+        push16(cpu, cpu->cs); push16(cpu, 0);
+        res_020191(cpu);
+    } else {
+        fprintf(stderr, "[WARN] PIC: Unknown callback %04X:%04X\n", cb_seg, cb_off);
+    }
+    cpu->dx = pop16(cpu);
+    cpu->cx = pop16(cpu);
+    cpu->bx = pop16(cpu);
+    cpu->si = mem_read16(cpu, cpu->ds, 0xC19E);
+}
+
+/* Helper: Read next variable-width LZW code from bitstream.
+ * Returns the code value. Manages bit buffer at DS:0x6886/0x6888. */
+static uint16_t pic_read_code(CPU *cpu)
+{
+    uint16_t bit_buf = mem_read16(cpu, cpu->ds, 0x6886);
+    uint8_t bits_avail = mem_read8(cpu, cpu->ds, 0x6888);
+    uint8_t code_bits = mem_read8(cpu, cpu->ds, 0x6880);
+
+    /* Shift out already-consumed bits */
+    uint8_t shift = 16 - bits_avail;
+    uint16_t bx = (shift < 16) ? (bit_buf >> shift) : 0;
+    uint8_t cl = bits_avail;
+
+    /* Read more words until we have enough bits */
+    while ((int8_t)cl < (int8_t)code_bits) {
+        /* Refill from compressed data buffer if needed */
+        if (cpu->si >= mem_read16(cpu, cpu->ds, 0x54D8)) {
+            pic_refill_buffer(cpu);
+        }
+        /* Read next 16 bits */
+        uint16_t word = mem_read16(cpu, cpu->ds, cpu->si);
+        cpu->si += 2;
+        mem_write16(cpu, cpu->ds, 0x6886, word);
+        bx |= (uint16_t)(word << cl);
+        cl += 16;
+    }
+
+    /* Extract the code */
+    cl -= code_bits;
+    mem_write8(cpu, cpu->ds, 0x6888, cl);
+    uint16_t mask = mem_read16(cpu, cpu->ds, 0x6882);
+    return bx & mask;
+}
+
+/* res_00124E - Reset LZW dictionary when it overflows.
+ * Near call (sp += 2 on return). */
+void res_00124E(CPU *cpu)
+{
+    /* Read new LZW parameters */
+    if (cpu->si >= mem_read16(cpu, cpu->ds, 0x54D8))
+        pic_refill_buffer(cpu);
+    cpu->ax = mem_read16(cpu, cpu->ds, cpu->si);
+    cpu->si += 2;
+    mem_write16(cpu, cpu->ds, 0xC19E, cpu->si);
+    if (cpu->al > 0x0B) cpu->al = 0x0B;
+    mem_write8(cpu, cpu->ds, 0x6881, cpu->al);
+    mem_write16(cpu, cpu->ds, 0x6886, cpu->ax);
+    mem_write8(cpu, cpu->ds, 0x6888, 0x8);
+    mem_write8(cpu, cpu->ds, 0x6880, 0x9);
+    mem_write16(cpu, cpu->ds, 0x6882, 0x1FF);
+    cpu->dx = 0x100;
+    mem_write16(cpu, cpu->ds, 0x6884, cpu->dx);
+    /* Clear dictionary parent pointers to 0xFFFF (unused) */
+    for (int i = 0; i < 0x800; i++) {
+        mem_write16(cpu, cpu->ds, (uint16_t)((i * 3) + (uint16_t)(-0x36CA & 0xFFFF)), 0xFFFF);
+    }
+    /* Init single-byte codes 0-255 */
+    for (int i = 0; i < 0x100; i++) {
+        mem_write8(cpu, cpu->ds, (uint16_t)((i * 3) + (uint16_t)(-0x36C8 & 0xFFFF)), (uint8_t)i);
+    }
+    cpu->sp += 2; /* near ret */
+}
+
+/* res_001205 - Initialize LZW decoder state.
+ * Near call (sp += 2 on return). */
+void res_001205(CPU *cpu)
+{
+    uint16_t w = mem_read16(cpu, cpu->ds, 0x6874);
+    uint16_t h = mem_read16(cpu, cpu->ds, 0x6876);
+    if ((w | h) == 0) {
+        cpu->sp += 2; return;
+    }
+    /* Initialize RLE state */
+    mem_write8(cpu, cpu->ds, 0x687E, 0x0);
+    mem_write8(cpu, cpu->ds, 0x687F, 0x0);
+    /* Set decode stack base */
+    mem_write16(cpu, cpu->ds, 0x687A, 0x6A8D);
+    /* Read initial parameters and init dictionary */
+    cpu->si = mem_read16(cpu, cpu->ds, 0xC19E);
+    push16(cpu, 0);
+    res_00124E(cpu);
+    cpu->sp += 2; /* near ret */
+}
+
+/* res_0012F6 - LZW decode: return next decompressed byte.
+ * This is the core LZW decoder. It maintains a decode stack (at DS:0x6A8D)
+ * where multi-byte LZW sequences are expanded. Each call returns one byte.
+ *
+ * The original code uses the x86 stack as the decode buffer (xchg sp, [687A]),
+ * pushing decoded chars onto it and popping them one at a time.
+ * We simulate this using the emulated memory stack.
+ *
+ * Returns decoded byte in AL.
+ * Near call (sp += 2 on return). */
+void res_0012F6(CPU *cpu)
+{
+    /* Dictionary layout: 3 bytes per entry at DS:[entry*3 - 0x36CA]
+     *   word: parent code (0xFFFF = root/single-byte)
+     *   byte: character value
+     * Entries 0-255 are single-byte codes. */
+    uint16_t dict_base_parent = (uint16_t)(-0x36CA & 0xFFFF);
+    uint16_t dict_base_char   = (uint16_t)(-0x36C8 & 0xFFFF);
+
+    /* Check if decode stack has buffered characters */
+    uint16_t decode_sp = mem_read16(cpu, cpu->ds, 0x687A);
+    if (decode_sp != 0x6A8D) {
+        /* Pop one byte from decode stack */
+        cpu->al = mem_read8(cpu, cpu->ds, decode_sp);
+        decode_sp += 2;  /* stack grows down, pop = sp += 2 (word-sized) */
+        mem_write16(cpu, cpu->ds, 0x687A, decode_sp);
+        cpu->sp += 2; /* near ret */
+        return;
+    }
+
+    /* Decode stack empty - need to decode next LZW code */
+    uint16_t dx = mem_read16(cpu, cpu->ds, 0x6884); /* next free dict entry */
+    uint16_t code = pic_read_code(cpu);
+    uint16_t cx = code;
+
+    /* Handle code >= next free entry (KwKwK case) */
+    if ((int16_t)code >= (int16_t)dx) {
+        cx = dx;
+        /* Push the first char of previous string */
+        uint16_t prev_first = mem_read16(cpu, cpu->ds, 0x688A);
+        uint8_t prev_first_char = mem_read8(cpu, cpu->ds, 0x688C);
+        /* Use the first char of the previous code's output */
+        decode_sp -= 2;
+        mem_write8(cpu, cpu->ds, decode_sp, prev_first_char);
+    }
+
+    /* Walk the dictionary chain, pushing characters onto decode stack */
+    uint16_t walk_code = cx;
+    while (1) {
+        uint16_t parent = mem_read16(cpu, cpu->ds, (uint16_t)(walk_code * 3 + dict_base_parent));
+        uint8_t ch = mem_read8(cpu, cpu->ds, (uint16_t)(walk_code * 3 + dict_base_char));
+        if ((int16_t)(parent + 1) == 0) {
+            /* Root code (parent == 0xFFFF): this is the first character */
+            /* Save as first char for dictionary update */
+            mem_write8(cpu, cpu->ds, 0x688C, ch);
+            /* Push it (will be popped last = output first) */
+            decode_sp -= 2;
+            mem_write8(cpu, cpu->ds, decode_sp, ch);
+            break;
+        }
+        /* Push character and continue walking */
+        decode_sp -= 2;
+        mem_write8(cpu, cpu->ds, decode_sp, ch);
+        walk_code = parent;
+    }
+
+    /* Add new dictionary entry: prev_code + first_char_of_current */
+    uint8_t first_char = mem_read8(cpu, cpu->ds, 0x688C);
+    mem_write8(cpu, cpu->ds, (uint16_t)(dx * 3 + dict_base_char), first_char);
+    uint16_t prev_code = mem_read16(cpu, cpu->ds, 0x688A);
+    mem_write16(cpu, cpu->ds, (uint16_t)(dx * 3 + dict_base_parent), prev_code);
+    dx++;
+
+    /* Check if dictionary needs to grow bit width */
+    uint16_t max_code = mem_read16(cpu, cpu->ds, 0x6882);
+    if ((int16_t)dx > (int16_t)max_code) {
+        uint8_t cur_bits = mem_read8(cpu, cpu->ds, 0x6880);
+        cur_bits++;
+        uint8_t max_bits = mem_read8(cpu, cpu->ds, 0x6881);
+        if ((int8_t)cur_bits > (int8_t)max_bits) {
+            /* Dictionary full - reset */
+            mem_write16(cpu, cpu->ds, 0x6884, dx);
+            mem_write16(cpu, cpu->ds, 0x688A, code);
+            push16(cpu, 0);
+            res_00124E(cpu);
+            dx = mem_read16(cpu, cpu->ds, 0x6884);
+        } else {
+            mem_write8(cpu, cpu->ds, 0x6880, cur_bits);
+            /* rcl word [0x6882], 1 → max_code = max_code * 2 + CF */
+            /* CF was set by stc before this in original code */
+            max_code = (max_code << 1) | 1;
+            mem_write16(cpu, cpu->ds, 0x6882, max_code);
+        }
+    }
+
+    mem_write16(cpu, cpu->ds, 0x6884, dx);
+    mem_write16(cpu, cpu->ds, 0x688A, code);
+
+    /* Pop first byte from decode stack */
+    cpu->al = mem_read8(cpu, cpu->ds, decode_sp);
+    decode_sp += 2;
+    mem_write16(cpu, cpu->ds, 0x687A, decode_sp);
+
+    cpu->sp += 2; /* near ret */
+}
+
+/* res_001284 - Decode one row of PIC data (RLE + LZW).
+ * Reads CX decompressed bytes via res_0012F6 (LZW) and applies
+ * PackBits RLE decoding (0x90 escape). Output goes to ES:DI.
+ *
+ * CX = pixel count (set by caller), DI = output buffer, SI = read ptr.
+ * Near call (sp += 2 on return). */
+void res_001284(CPU *cpu)
+{
+    uint8_t is_4bit = mem_read8(cpu, cpu->ds, 0x6889);
+
+    /* Adjust pixel count for 4-bit mode */
+    if (is_4bit) {
+        cpu->cx++;
+        cpu->cx >>= 1;
+    }
+    mem_write16(cpu, cpu->ds, 0x687C, cpu->cx);
+
+    /* Main decode loop: decode pixels one at a time */
+    while (mem_read16(cpu, cpu->ds, 0x687C) != 0) {
+        if (mem_read8(cpu, cpu->ds, 0x687E) != 0) {
+            /* RLE repeat: output previous byte again */
+            cpu->al = mem_read8(cpu, cpu->ds, 0x687F);
+            mem_write8(cpu, cpu->ds, 0x687E,
+                       (uint8_t)(mem_read8(cpu, cpu->ds, 0x687E) - 1));
+        } else {
+            /* Get next decompressed byte from LZW */
+            push16(cpu, 0);
+            res_0012F6(cpu);
+
+            if (cpu->al == 0x90) {
+                /* PackBits RLE escape */
+                push16(cpu, 0);
+                res_0012F6(cpu);
+                if (cpu->al == 0) {
+                    /* Literal 0x90 byte */
+                    cpu->al = 0x90;
+                    mem_write8(cpu, cpu->ds, 0x687F, cpu->al);
+                } else {
+                    /* Repeat previous byte (count-1) more times */
+                    cpu->al--;
+                    mem_write8(cpu, cpu->ds, 0x687E, cpu->al);
+                    cpu->al = mem_read8(cpu, cpu->ds, 0x687F);
+                    mem_write8(cpu, cpu->ds, 0x687E,
+                               (uint8_t)(mem_read8(cpu, cpu->ds, 0x687E) - 1));
+                }
+            } else {
+                mem_write8(cpu, cpu->ds, 0x687F, cpu->al);
+            }
+        }
+
+        /* Output pixel(s) */
+        if (is_4bit) {
+            cpu->ah = cpu->al;
+            cpu->al &= 0x0F;
+            cpu->ah >>= 4;
+            mem_write8(cpu, cpu->es, cpu->di, cpu->al);
+            mem_write8(cpu, cpu->es, (uint16_t)(cpu->di + 1), cpu->ah);
+            cpu->di += 2;
+        } else {
+            mem_write8(cpu, cpu->es, cpu->di, cpu->al);
+            cpu->di++;
+        }
+
+        mem_write16(cpu, cpu->ds, 0x687C,
+                    (uint16_t)(mem_read16(cpu, cpu->ds, 0x687C) - 1));
+    }
+
+    cpu->sp += 2; /* near ret */
 }

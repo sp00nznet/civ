@@ -224,6 +224,22 @@ void res_02A310(CPU *cpu)
     }
 
     /*
+     * Dump decompressed resident image for offline analysis/lifting.
+     * The dump starts at LOAD_SEG:0000 and covers the full decompressed
+     * image (DGROUP paragraphs * 16 bytes).
+     */
+    {
+        uint32_t base = seg_off(CIV_LOAD_SEG, 0);
+        uint32_t size = (uint32_t)(CIV_LOAD_SEG + CIV_DGROUP) * 16 - base;
+        FILE *dump = fopen("civ_decompressed.bin", "wb");
+        if (dump) {
+            fwrite(cpu->mem + base, 1, size, dump);
+            fclose(dump);
+            printf("[STARTUP] Dumped decompressed image: %u bytes to civ_decompressed.bin\n", size);
+        }
+    }
+
+    /*
      * Step 2: Set segment registers.
      * After EXEPACK decompression, DGROUP is at CIV_DGROUP paragraphs
      * from LOAD_SEG. DS = ES = SS (MSC DGROUP model).
@@ -299,6 +315,22 @@ void res_02A310(CPU *cpu)
         uint16_t int3f_off = cpu->mem[0xFC] | (cpu->mem[0xFD] << 8);
         uint16_t int3f_seg = cpu->mem[0xFE] | (cpu->mem[0xFF] << 8);
         printf("[INT3F] Vector: %04X:%04X\n", int3f_seg, int3f_off);
+
+        /* Dump thunk table entries at image offset 0x0761 */
+        printf("[THUNKS] Dumping thunk table (7-byte entries at off 0x0761):\n");
+        for (int i = 0; i < 40; i++) {
+            uint32_t taddr = base + 0x0761 + i * 7;
+            uint8_t *t = &cpu->mem[taddr];
+            if (t[0] == 0xCD && t[1] == 0x3F) {
+                uint8_t ovl = t[2];
+                uint16_t ovl_off = t[3] | (t[4] << 8);
+                printf("[THUNK] #%02d off=0x%04X ovl=%02d ovl_off=0x%04X ctx=%02X %02X %02X %02X %02X %02X %02X\n",
+                       i, 0x0761 + i*7, ovl, ovl_off, t[0], t[1], t[2], t[3], t[4], t[5], t[6]);
+            } else {
+                printf("[THUNK] #%02d off=0x%04X NOT INT3F: %02X %02X %02X %02X %02X %02X %02X\n",
+                       i, 0x0761 + i*7, t[0], t[1], t[2], t[3], t[4], t[5], t[6]);
+            }
+        }
     }
 
     printf("[STARTUP] Calling C main (res_001A66)...\n");

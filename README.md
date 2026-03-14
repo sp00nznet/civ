@@ -189,6 +189,7 @@ civ/
 │       ├── decode16.py          # 16-bit x86 instruction decoder
 │       ├── analyze.py           # Function boundary & call graph analyzer
 │       ├── lift.py              # x86-16 to C code lifter
+│       ├── lift_from_dump.py    # EXEPACK dump lifter (decompressed code)
 │       ├── recomp.py            # Main recompilation driver
 │       ├── map_thunks.py        # Overlay thunk table decoder (EXEPACK + 7-byte entries)
 │       ├── map_thunks2.py       # Thunk caller analysis & cross-overlay constraint solver
@@ -218,6 +219,7 @@ civ/
 └── RecompiledFuncs/             # Auto-generated C output (gitignored)
     ├── civ_recomp.h             # Master header (482 function declarations)
     ├── civ_recomp_000..009.c    # Recompiled game code (132K lines)
+    ├── civ_dump_lifted.c        # Functions lifted from EXEPACK dump (171 funcs)
     ├── civ_impl.c               # Hand-written implementations (tracked in git)
     ├── civ_stubs.c              # Stub functions for unresolved symbols (auto-generated)
     └── civ_aliases.c            # Overlay thunk aliases (auto-generated)
@@ -313,14 +315,15 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [x] Port I/O lifting (IN/OUT -> port_in8/port_out8 dispatch)
 - [x] Batch compilation output (split across .c files)
 - [x] Symbol table export (TOML format)
-- [x] Stub generation for unresolved symbols (553 stubs)
+- [x] Stub generation for unresolved symbols
+- [x] EXEPACK dump lifter (`lift_from_dump.py`) — lifts functions from decompressed memory dump
 
 **Recompilation Results:**
 ```
-  Functions:     482 (329 resident + 153 overlay)
-  Instructions:  106,935
-  Code bytes:    280,991 (274.4 KB)
-  Output:        132,585 lines of C across 10 source files + 553 stubs
+  Functions:     482 resident/overlay + 171 dump-lifted = 653 total
+  Instructions:  106,935+ (resident/overlay)
+  Code bytes:    280,991 (274.4 KB) resident/overlay + dump-lifted code
+  Output:        ~150K lines of C across 10 recomp files + dump_lifted + impl + stubs
   Errors:        0
 ```
 
@@ -384,7 +387,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [ ] Complete thunk-to-overlay-function mapping (64 active EA entries -> 155 overlay functions)
 - [ ] Remaining stub resolution
 
-### Phase 6 — World Generation *(current)*
+### Phase 6 — World Generation & Game Handler
 
 - [x] Terrain seed placement (ovl07_034D88) working
 - [x] Terrain growth scan loop working
@@ -392,42 +395,56 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [x] Jump Table 2 (terrain feature placement, 14 cases) reconstructed from binary
 - [x] Continent placement (ovl07_034A5C) working — finds ocean tiles correctly
 - [x] Terrain detail pass (ovl07_034E33) working
-- [x] World generation animation (ovl07_035B6E) running — progresses through phases
+- [x] World generation animation skipped (ovl07_035B6E bypass)
+- [x] **Game handler reached (res_0022DA) — main game loop active**
+- [x] Keyboard input polling (KBHIT via SDL2)
 - [x] Timer speed multiplier (20x) for faster animation playback
-- [ ] Animation completion — loop has hundreds of phases, needs optimization or skip
-- [ ] far_0000_07ED (blit function) — stub, needs implementation for rendering
-- [ ] far_205A_2AC0 (climate/temperature) — returns 0, causes uniform terrain
-- [ ] far_1B05_131A / far_1B05_182A — heavily called map display functions (stubs)
 
-### Phase 7 — Game Data & Audio HAL
+### Phase 7 — EXEPACK Code Lifting & CRT *(current)*
 
-- [ ] .PIC image loader (native format support)
+- [x] Decompressed memory dump tool (startup.c dumps civ_decompressed.bin at runtime)
+- [x] **lift_from_dump.py** — lifts functions from decompressed dump for EXEPACK-compressed code
+- [x] **171 functions lifted** from decompressed dump (display, map, CRT, game state)
+- [x] MSC 5.x CRT functions lifted (39 functions: _open, _read, _write, _lseek, file table mgmt)
+- [x] Display subsystem lifted (far_1DDE_* — 15 rendering/GFX context functions)
+- [x] Map display functions lifted (far_1B05_* — 25 map rendering functions)
+- [x] Game state functions lifted (far_15D8_* — 12 functions including main game state)
+- [x] Blit function implemented (far_0000_07ED — 8-arg rectangle copy between GFX pages)
+- [x] Climate/temperature stub (far_205A_2AC0 returns uniform climate for now)
+- [x] File access working (game opens and checks .pic, .cv, .exe files)
+- [x] **First pixels rendered** (nonzero framebuffer pixels detected in game loop)
+- [ ] CRT near-call helpers (20 res_ functions stubbed — internal CRT plumbing)
+- [ ] Page flip / display copy (far_0000_07E6 still stubbed — back buffer not visible)
+- [ ] File I/O completion (fonts.cv, .pic loading needs full CRT read chain)
+
+### Phase 8 — Rendering & Game Data
+
+- [ ] Page flip implementation (page 1 → page 0 display copy)
+- [ ] .PIC image loader (LZW decompression implemented, loading chain needed)
 - [ ] .PAL palette loader
-- [ ] .CVL sound data loader
 - [ ] .CV font renderer
-- [ ] SDL2 audio output (AdLib OPL2 synthesis or PCM playback)
+- [ ] Map tile rendering
+- [ ] UI chrome rendering
 
-### Phase 8 — Integration & Testing
+### Phase 9 — Gameplay
 
-- [ ] Boot sequence (MicroProse logo → title screen)
 - [ ] Menu navigation (New Game / Load / Earth / Custom)
-- [ ] Game initialization (world generation, civ selection)
-- [ ] Map rendering (terrain tiles, units, cities)
 - [ ] City management screen
 - [ ] Diplomacy screens
 - [ ] Combat resolution
 - [ ] Technology tree
-- [ ] Wonder movies / screens
+- [ ] Wonder screens
 - [ ] Save/load game state
 - [ ] Hall of Fame
 
-### Phase 9 — Polish & Enhancement
+### Phase 10 — Audio & Polish
 
+- [ ] .CVL sound data loader
+- [ ] SDL2 audio output (AdLib OPL2 synthesis or PCM playback)
 - [ ] Integer scaling (1x, 2x, 3x, 4x)
 - [ ] Windowed / fullscreen toggle
 - [ ] Modern input improvements (scroll wheel for zoom, etc.)
 - [ ] Windows 11 installer / portable build
-- [ ] Gamepad support (optional)
 
 ---
 
