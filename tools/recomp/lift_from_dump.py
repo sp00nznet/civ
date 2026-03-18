@@ -213,19 +213,35 @@ DEFAULT_STUBS = [
     ('far_085F_25BD', 0x085F, 0x25BD),
     ('far_085F_257B', 0x085F, 0x257B),
     ('far_085F_259C', 0x085F, 0x259C),
+    # Resident far function (segment 0x0AD4)
+    ('far_0AD4_2297', 0x0AD4, 0x2297),
+]
+
+# Near (resident) functions to lift - format: (name, flat_offset)
+# These are called via NEAR CALL and return with RET (not RETF)
+NEAR_STUBS = [
+    ('res_01C813', 0x01C813),
+    # res_01C49C conflicts with far_1B05_144C at same dump offset - use far version
+    # res_01C524 conflicts with far_1B05_14D4 at same dump offset - use far version
+    ('res_01C605', 0x01C605),
+    ('res_01D221', 0x01D221),
+    # res_01F81D conflicts with far_1F67_01AD at same dump offset - use far version
+    # res_01FAE1 conflicts with far_1F67_0471 at same dump offset - use far version
+    # res_01F670 conflicts with far_1F67_0000 at same dump offset - use far version
 ]
 
 
-def find_function_end(data, start, max_scan=4096):
+def find_function_end(data, start, max_scan=4096, is_far=True):
     """Find the end of a function by scanning for the epilogue pattern
     and/or the next prologue."""
     decoder = Decoder(data[start:start + max_scan], base_offset=start)
     instructions = decoder.decode_all()
 
+    ret_mnemonic = 'retf' if is_far else 'ret'
     last_ret = start
     for i, inst in enumerate(instructions):
-        # Check for RETF (far return) - likely end of function
-        if inst.mnemonic == 'retf':
+        # Check for RET/RETF - likely end of function
+        if inst.mnemonic == ret_mnemonic or inst.mnemonic == 'retf':
             last_ret = inst.offset + inst.length
             # If the next instruction is a prologue or we're past the return,
             # this is likely the end
@@ -266,11 +282,18 @@ def main():
         dump = f.read()
     print(f"Loaded dump: {len(dump)} bytes")
 
+    # Build combined stub list: (name, dump_offset, is_far)
+    all_stubs = []
+    for name, seg, off in DEFAULT_STUBS:
+        all_stubs.append((name, seg * 16 + off, True))
+    for name, flat_off in NEAR_STUBS:
+        all_stubs.append((name, flat_off, False))
+
     # Select which stubs to lift
     if specs:
         stubs = []
         for spec in specs:
-            for s in DEFAULT_STUBS:
+            for s in all_stubs:
                 if s[0] == spec:
                     stubs.append(s)
                     break
@@ -280,9 +303,12 @@ def main():
                 if len(parts) == 3 and parts[0] == 'far':
                     seg = int(parts[1], 16)
                     off = int(parts[2], 16)
-                    stubs.append((spec, seg, off))
+                    stubs.append((spec, seg * 16 + off, True))
+                elif len(parts) == 2 and parts[0] == 'res':
+                    flat = int(parts[1], 16)
+                    stubs.append((spec, flat, False))
     else:
-        stubs = DEFAULT_STUBS
+        stubs = all_stubs
 
     # Build known functions map from dump (prologue scan)
     known_funcs = {}
@@ -292,8 +318,7 @@ def main():
     errors = 0
     skipped = 0
 
-    for name, seg, off in stubs:
-        dump_off = seg * 16 + off
+    for name, dump_off, is_far in stubs:
         if dump_off >= len(dump):
             print(f"  {name}: offset 0x{dump_off:06X} out of range, skipping")
             skipped += 1
@@ -308,9 +333,10 @@ def main():
                 continue
 
         # Find function end
-        func_end = find_function_end(dump, dump_off)
+        func_end = find_function_end(dump, dump_off, is_far=is_far)
         func_size = func_end - dump_off
-        print(f"  {name}: 0x{dump_off:06X} - 0x{func_end:06X} ({func_size} bytes)")
+        kind = "FAR" if is_far else "NEAR"
+        print(f"  {name} ({kind}): 0x{dump_off:06X} - 0x{func_end:06X} ({func_size} bytes)")
 
         # Decode and lift
         code = dump[dump_off:func_end]
@@ -319,7 +345,7 @@ def main():
 
         lifter = Lifter(overlay_bases={}, hdr_size=0, known_funcs=known_funcs)
         try:
-            c_code = lifter.lift_function(name, instructions, dump_off, is_far=True)
+            c_code = lifter.lift_function(name, instructions, dump_off, is_far=is_far)
             lifted_code.append((name, dump_off, func_end, c_code))
             all_calls.update(lifter.func_calls)
             all_calls.update(lifter.ovl_calls)
@@ -342,8 +368,10 @@ def main():
     import re
     LOAD_SEG = 0x0100
 
-    # Build set of function names to preserve (from DEFAULT_STUBS)
+    # Build set of function names to preserve (defined functions and res_ names)
     preserved_names = set(name for name, _, _, _ in lifted_code)
+    # Also preserve any res_ names referenced in calls
+    preserved_names.update(n for n in all_calls if n.startswith('res_'))
 
     def unrelocate_far_name(match):
         full = match.group(0)

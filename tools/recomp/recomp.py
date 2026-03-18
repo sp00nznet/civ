@@ -124,19 +124,32 @@ def recompile(exe_path: str, output_dir: str, funcs_per_file: int = 50):
     # Collect hand-written implementations BEFORE writing output files,
     # so we can exclude them from the auto-generated recomp files too.
     import re
-    impl_funcs = set()
+    impl_funcs = set()  # Functions in civ_impl.c/civ_aliases.c (exclude from recomp output)
+    dump_funcs = set()  # Functions in civ_dump_lifted.c (only exclude from stubs, NOT from recomp)
     alias_externs = set()
     for impl_file in ['civ_impl.c', 'civ_aliases.c']:
         impl_path = os.path.join(output_dir, impl_file)
         if os.path.exists(impl_path):
             with open(impl_path, 'r') as f:
                 content = f.read()
-                for match in re.finditer(r'^void\s+(\w+)\s*\(', content, re.MULTILINE):
+                for match in re.finditer(r'^void\s+(\w+)\s*\([^)]*\)\s*\{', content, re.MULTILINE):
                     impl_funcs.add(match.group(1))
                 for match in re.finditer(r'^extern\s+void\s+(\w+)\s*\(', content, re.MULTILINE):
                     alias_externs.add(match.group(1))
+    # Dump-lifted functions: exclude from stubs but NOT from recomp output
+    # (recomp output has better overlay-relative code; dump versions are fallback)
+    dump_path = os.path.join(output_dir, 'civ_dump_lifted.c')
+    if os.path.exists(dump_path):
+        with open(dump_path, 'r') as f:
+            content = f.read()
+            for match in re.finditer(r'^void\s+(\w+)\s*\([^)]*\)\s*\{', content, re.MULTILINE):
+                dump_funcs.add(match.group(1))
+            for match in re.finditer(r'^extern\s+void\s+(\w+)\s*\(', content, re.MULTILINE):
+                alias_externs.add(match.group(1))
     if impl_funcs:
         print(f"  Found {len(impl_funcs)} hand-written implementations to exclude from recomp files")
+    if dump_funcs:
+        print(f"  Found {len(dump_funcs)} dump-lifted functions to exclude from stubs")
 
     # Write output files (split across multiple .c files)
     print(f"\n--- Phase 3: Output ---")
@@ -184,13 +197,19 @@ def recompile(exe_path: str, output_dir: str, funcs_per_file: int = 50):
     # Generate stubs for unresolved symbols (functions referenced but not defined)
     unresolved = all_referenced - all_names
 
-    # Exclude impl functions from stubs
-    if impl_funcs:
-        unresolved -= impl_funcs
-        print(f"  Excluded {len(impl_funcs)} functions with hand-written implementations")
+    # Exclude impl and dump functions from stubs
+    all_impl = impl_funcs | dump_funcs
+    if all_impl:
+        unresolved -= all_impl
+        print(f"  Excluded {len(all_impl)} functions with implementations")
+
+    # Exclude HAL functions defined in dos_compat.c
+    hal_funcs = {'dos_int21', 'bios_int10', 'bios_int16', 'mouse_int33',
+                 'int_handler', 'port_out8', 'port_in8'}
+    unresolved -= hal_funcs
 
     # Add alias extern targets that aren't defined anywhere
-    alias_needs_stub = alias_externs - all_names - impl_funcs
+    alias_needs_stub = alias_externs - all_names - all_impl - hal_funcs
     if alias_needs_stub:
         unresolved |= alias_needs_stub
         print(f"  Added {len(alias_needs_stub)} alias extern targets to stubs")

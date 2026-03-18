@@ -320,7 +320,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 
 **Recompilation Results:**
 ```
-  Functions:     482 resident/overlay + 171 dump-lifted = 653 total
+  Functions:     482 resident/overlay + 175 dump-lifted = 657 total
   Instructions:  106,935+ (resident/overlay)
   Code bytes:    280,991 (274.4 KB) resident/overlay + dump-lifted code
   Output:        ~150K lines of C across 10 recomp files + dump_lifted + impl + stubs
@@ -404,7 +404,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 
 - [x] Decompressed memory dump tool (startup.c dumps civ_decompressed.bin at runtime)
 - [x] **lift_from_dump.py** — lifts functions from decompressed dump for EXEPACK-compressed code
-- [x] **171 functions lifted** from decompressed dump (display, map, CRT, game state)
+- [x] **175 functions lifted** from decompressed dump (display, map, CRT, game state, rendering)
 - [x] MSC 5.x CRT functions lifted (39 functions: _open, _read, _write, _lseek, file table mgmt)
 - [x] Display subsystem lifted (far_1DDE_* — 15 rendering/GFX context functions)
 - [x] Map display functions lifted (far_1B05_* — 25 map rendering functions)
@@ -413,8 +413,14 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [x] Climate/temperature stub (far_205A_2AC0 returns uniform climate for now)
 - [x] File access working (game opens and checks .pic, .cv, .exe files)
 - [x] **First pixels rendered** (nonzero framebuffer pixels detected in game loop)
-- [ ] CRT near-call helpers (20 res_ functions stubbed — internal CRT plumbing)
+- [x] Near function lifting support added to lift_from_dump.py (NEAR_STUBS with is_far=False)
+- [x] Near-far alias pattern for conflicting functions (same code at same offset, different calling conventions)
+- [x] Resident rendering functions lifted: res_01C813, res_01C605, res_01D221 (NEAR)
+- [x] Pipeline improvements: recomp.py excludes dump-lifted funcs from stubs without affecting recomp output
+- [x] Thunk table deep analysis: 7-byte entries, overlay manager init at 0x0B60, descriptor patching
+- [ ] World gen hang: game stuck after phase 5 (likely input wait or timer issue)
 - [ ] Page flip / display copy (far_0000_07E6 still stubbed — back buffer not visible)
+- [ ] Thunk-to-overlay mapping (far_0000_07E6, far_0000_083F still unresolved)
 - [ ] File I/O completion (fonts.cv, .pic loading needs full CRT read chain)
 
 ### Phase 8 — Rendering & Game Data
