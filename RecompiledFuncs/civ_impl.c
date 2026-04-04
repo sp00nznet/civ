@@ -66,6 +66,15 @@ void far_205A_2096(CPU *cpu)
     DosState *dos = get_dos_state(cpu);
     if (dos->poll_events)
         dos->poll_events(dos->platform_ctx, dos, cpu);
+
+    /* Auto-inject Space key after 200 polls if no real key pressed.
+     * This advances past "press any key" screens during startup. */
+    if (!keyboard_available(&dos->keyboard) && call_count >= 200 && (call_count % 200) == 0) {
+        keyboard_push(&dos->keyboard, 0x39, 0x20); /* Space: scan=0x39, ascii=0x20 */
+        fprintf(stderr, "[KBHIT] Auto-injected Space at poll #%llu\n",
+                (unsigned long long)call_count);
+    }
+
     cpu->ax = keyboard_available(&dos->keyboard) ? 0x00FF : 0x0000;
     if (call_count <= 5 || (call_count % 500) == 0) {
         fprintf(stderr, "[KBHIT] #%llu result=%u\n",
@@ -516,8 +525,11 @@ void ovl07_035B6E(CPU *cpu)
 {
     static int call_count = 0;
     call_count++;
-    if (call_count <= 5 || (call_count % 1000) == 0)
-        fprintf(stderr, "[ANIM_SKIP] ovl07_035B6E call #%d sp=%04X\n", call_count, cpu->sp);
+    if (call_count <= 20 || (call_count % 100000) == 0)
+        fprintf(stderr, "[ANIM] #%d sp=%04X bp=%04X 678E=%04X EB78=%04X\n",
+                call_count, cpu->sp, cpu->bp,
+                mem_read16(cpu, cpu->ds, 0x678E),
+                mem_read16(cpu, cpu->ds, 0xEB78));
 
     /* Return AX=0 (no animation work to do) */
     cpu->ax = 0;
