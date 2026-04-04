@@ -28,7 +28,7 @@ SYMBOLS = [
     "res_01E117", "res_01E478", "res_01EA96",
     "res_020418",
     "res_02120A", "res_02178A", "res_02187C", "res_021A1C",
-    "res_021B8E", "res_021BEC", "res_021F13", "res_0220AA", "res_02236A",
+    "res_021B8E", "res_021BEC", "res_021F13", "res_02236A",
     "res_022BE8", "res_0230B0", "res_0230C6", "res_0230D7", "res_0230E2",
     "res_023121", "res_023189", "res_02339F", "res_0233BB", "res_0233D7",
     "res_023470",

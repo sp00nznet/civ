@@ -616,32 +616,74 @@ void res_001E52(CPU *cpu)
 }
 
 /* ─── MSC CRT: _aFchkstk (far stack check) ─── */
-/* far_205A_1B8C - MSC far stack check.
- * Called before functions with large local variables.
- * Original: pops return address, checks SP against stack limit at DS:0x58EA,
- * pushes return address back, returns. We have plenty of stack - always succeed.
- * AX contains bytes requested; we subtract from SP to allocate. */
+/* far_205A_1B8C - MSC _aFchkstk (far stack available check).
+ * Original: POP CX; POP DX (save return addr); check stack limit at DS:58EA;
+ * return AX = available stack space (or 0 if overflow); PUSH DX; PUSH CX; RETF.
+ * NOT an allocator - just checks available space. We always report plenty. */
 void far_205A_1B8C(CPU *cpu)
 {
-    /* Pop near return IP and far return CS from stack (the calling convention
-     * for _chkstk is unusual: CALL FAR _chkstk, so ret addr is on stack) */
     uint16_t ret_ip = pop16(cpu);
     uint16_t ret_cs = pop16(cpu);
-    /* Subtract requested bytes from SP (the allocation) */
-    cpu->sp = (uint16_t)(cpu->sp - cpu->ax);
-    /* Push return address back and return */
+    uint16_t limit = mem_read16(cpu, cpu->ds, 0x58EA);
+    if (limit >= cpu->sp) {
+        cpu->ax = 0;
+    } else {
+        cpu->ax = (uint16_t)(cpu->sp - limit);
+    }
+    static int cc = 0; cc++;
+    if (cc <= 5)
+        fprintf(stderr, "[CHKSTK] #%d sp=%04X limit=%04X avail=%04X\n",
+                cc, cpu->sp, limit, cpu->ax);
     push16(cpu, ret_cs);
     push16(cpu, ret_ip);
-    /* RETF */
-    cpu->sp += 4;
+    cpu->sp += 4; /* retf */
 }
 
-/* ─── MSC CRT: _aFchkstk near helper (res_0207C7) ─── */
-/* res_0207C7 - Near version of stack probe used internally.
- * Just adjust SP by AX (allocation size) and return. */
+/* ─── MSC CRT: res_0207C7 (near stack helper) ─── */
+/* res_0207C7 - Near internal CRT helper for buffer management.
+ * This is a mid-function entry point - just return cleanly. */
 void res_0207C7(CPU *cpu)
 {
-    cpu->sp = (uint16_t)(cpu->sp - cpu->ax);
+    cpu->sp += 2; /* near ret */
+}
+
+/* ─── MSC CRT: res_0220AA (buffer write/flush) ─── */
+/* res_0220AA - Internal CRT subroutine to write buffer to file via INT 21h.
+ * Called as NEAR from within far_205A_1A62 (_read/_write implementation).
+ * Original: PUSH AX/BX/CX; CX = DI-DX (bytes); INT 21h/AH=40h (write);
+ *           ADD [BP-2],AX (count); POP CX/BX/AX; DI=DX (reset). */
+void res_0220AA(CPU *cpu) {
+    uint16_t saved_ax = cpu->ax;
+    uint16_t saved_bx = cpu->bx;
+    uint16_t saved_cx = cpu->cx;
+
+    uint16_t count = (uint16_t)(cpu->di - cpu->dx); /* bytes to write */
+    if (count == 0) {
+        cpu->sp += 2; /* near ret */
+        return;
+    }
+
+    /* Call DOS write: AH=40h, BX=handle from [BP+6], CX=count, DS:DX=buffer */
+    uint16_t handle = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6));
+    cpu->bx = handle;
+    cpu->cx = count;
+    cpu->ah = 0x40;
+    dos_int21(cpu);
+
+    if (!(cpu->flags & FLAG_CF)) {
+        /* Success: add bytes written to [BP-2] */
+        uint16_t prev = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x2));
+        mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x2), (uint16_t)(prev + cpu->ax));
+    }
+
+    /* Reset buffer pointer */
+    cpu->di = cpu->dx;
+
+    /* Restore registers */
+    cpu->cx = saved_cx;
+    cpu->bx = saved_bx;
+    cpu->ax = saved_ax;
+
     cpu->sp += 2; /* near ret */
 }
 
