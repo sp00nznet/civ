@@ -31,3 +31,23 @@ void res_01C524(CPU *cpu) { push16(cpu, cpu->cs); far_1B05_14D4(cpu); }
 void res_01F81D(CPU *cpu) { push16(cpu, cpu->cs); far_1F67_01AD(cpu); }
 void res_01FAE1(CPU *cpu) { push16(cpu, cpu->cs); far_1F67_0471(cpu); }
 void res_01F670(CPU *cpu) { push16(cpu, cpu->cs); far_1F67_0000(cpu); }
+
+/* Thunk table aliases - thunks resolved to overlay functions.
+ * The thunk table at 0x0761 has 7-byte entries indexed by overlay function.
+ * Entry# = (offset - 0x0761) / 7. Mapping: OVL functions in order across overlays.
+ */
+extern void ovl02_02CDD7(CPU *cpu);  /* entry 2 */
+extern void ovl02_02D72A(CPU *cpu);  /* entry 3 */
+extern void ovl03_02E45D(CPU *cpu);  /* entry 12 */
+extern void ovl05_02FFC2(CPU *cpu);  /* entry 19 */
+extern void ovl05_0307DA(CPU *cpu);  /* entry 21 */
+extern void ovl07_0349D4(CPU *cpu);  /* entry 38 */
+extern void ovl12_03D15C(CPU *cpu);  /* entry 91 */
+
+void far_0000_076F(CPU *cpu) { ovl02_02CDD7(cpu); }
+void far_0000_0776(CPU *cpu) { ovl02_02D72A(cpu); }
+void far_0000_07B5(CPU *cpu) { ovl03_02E45D(cpu); }
+void far_0000_07E6(CPU *cpu) { ovl05_02FFC2(cpu); }
+void far_0000_07F4(CPU *cpu) { ovl05_0307DA(cpu); }
+void far_0000_086B(CPU *cpu) { ovl07_0349D4(cpu); }
+void far_0000_09DE(CPU *cpu) { ovl12_03D15C(cpu); }

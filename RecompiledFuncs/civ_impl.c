@@ -615,6 +615,36 @@ void res_001E52(CPU *cpu)
     cpu->sp += 2; /* near ret */
 }
 
+/* ─── MSC CRT: _aFchkstk (far stack check) ─── */
+/* far_205A_1B8C - MSC far stack check.
+ * Called before functions with large local variables.
+ * Original: pops return address, checks SP against stack limit at DS:0x58EA,
+ * pushes return address back, returns. We have plenty of stack - always succeed.
+ * AX contains bytes requested; we subtract from SP to allocate. */
+void far_205A_1B8C(CPU *cpu)
+{
+    /* Pop near return IP and far return CS from stack (the calling convention
+     * for _chkstk is unusual: CALL FAR _chkstk, so ret addr is on stack) */
+    uint16_t ret_ip = pop16(cpu);
+    uint16_t ret_cs = pop16(cpu);
+    /* Subtract requested bytes from SP (the allocation) */
+    cpu->sp = (uint16_t)(cpu->sp - cpu->ax);
+    /* Push return address back and return */
+    push16(cpu, ret_cs);
+    push16(cpu, ret_ip);
+    /* RETF */
+    cpu->sp += 4;
+}
+
+/* ─── MSC CRT: _aFchkstk near helper (res_0207C7) ─── */
+/* res_0207C7 - Near version of stack probe used internally.
+ * Just adjust SP by AX (allocation size) and return. */
+void res_0207C7(CPU *cpu)
+{
+    cpu->sp = (uint16_t)(cpu->sp - cpu->ax);
+    cpu->sp += 2; /* near ret */
+}
+
 /* ─── Page/cursor control ─── */
 /* far_0000_0838 - VGA page/cursor control.
  * Stack: [ret_addr 4] [page_or_flag 2]

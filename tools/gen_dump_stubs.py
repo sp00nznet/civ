@@ -4,7 +4,7 @@
 import sys
 
 SYMBOLS = [
-    "far_0000_1041", "far_0000_1080", "far_0000_11FA",
+    "far_0000_1041",
     "far_0181_000C", "far_0181_005E", "far_0181_0088", "far_0181_00B5",
     "far_0181_00F1", "far_0181_0136", "far_0181_014A",
     "far_01A7_02A6", "far_01A7_046E",
@@ -22,16 +22,19 @@ SYMBOLS = [
     "res_0153E1", "res_015970", "res_0159E1", "res_015A5D", "res_015C2F",
     "res_0193F1", "res_01951C", "res_0196D3",
     "res_01AE30", "res_01AEDF",
-    "res_01BFF7", "res_01C218", "res_01C29F", "res_01C38E", "res_01C5C9",
+    "res_01BFF7", "res_01C218", "res_01C29F", "res_01C38E",
     "res_01CA8D", "res_01CBB8", "res_01CFF5", "res_01D0C4", "res_01D18F",
     "res_01D665", "res_01DBF5", "res_01DC56", "res_01DE5C", "res_01DFE8",
-    "res_01E117", "res_01E478", "res_01EA96", "res_01F0CD",
-    "res_01FB68", "res_01FBFC", "res_02013E", "res_020418",
+    "res_01E117", "res_01E478", "res_01EA96",
+    "res_020418",
     "res_02120A", "res_02178A", "res_02187C", "res_021A1C",
     "res_021B8E", "res_021BEC", "res_021F13", "res_0220AA", "res_02236A",
     "res_022BE8", "res_0230B0", "res_0230C6", "res_0230D7", "res_0230E2",
     "res_023121", "res_023189", "res_02339F", "res_0233BB", "res_0233D7",
     "res_023470",
+    # Near functions called by far_0000_1080 / far_0000_11FA (lifted from dump)
+    "res_001219", "res_001262", "res_001298", "res_00130A",
+    # (res_0207C7 and far_205A_1B8C now hand-implemented in civ_impl.c)
 ]
 
 def main():
@@ -46,10 +49,15 @@ def main():
             lines = lines[:i]
             break
 
+    existing = ''.join(lines)
     with open(stubs_file, 'w', newline='\n') as f:
         f.writelines(lines)
         f.write('\n/* --- Additional stubs for dump-lifted dependencies --- */\n')
+        count = 0
         for sym in SYMBOLS:
+            if f'void {sym}(CPU *cpu)' in existing:
+                continue
+            count += 1
             is_far = sym.startswith('far_') or sym.startswith('ovl')
             ret_size = 4 if is_far else 2
             ret_type = 'far' if is_far else 'near'

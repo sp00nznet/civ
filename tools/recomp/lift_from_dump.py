@@ -215,6 +215,15 @@ DEFAULT_STUBS = [
     ('far_085F_259C', 0x085F, 0x259C),
     # Resident far function (segment 0x0AD4)
     ('far_0AD4_2297', 0x0AD4, 0x2297),
+    # Resident far functions at segment 0x0000 (hot-path display/rendering)
+    ('far_0000_1080', 0x0000, 0x1080),
+    ('far_0000_11FA', 0x0000, 0x11FA),
+    # MSC CRT file I/O functions
+    ('far_205A_019C', 0x205A, 0x019C),
+    ('far_205A_257C', 0x205A, 0x257C),
+    ('far_205A_2930', 0x205A, 0x2930),
+    ('far_205A_308C', 0x205A, 0x308C),
+    ('far_205A_30CC', 0x205A, 0x30CC),
 ]
 
 # Near (resident) functions to lift - format: (name, flat_offset)
@@ -225,6 +234,16 @@ NEAR_STUBS = [
     # res_01C524 conflicts with far_1B05_14D4 at same dump offset - use far version
     ('res_01C605', 0x01C605),
     ('res_01D221', 0x01D221),
+    # File I/O functions needed for PIC loading
+    ('res_01FB68', 0x01FB68),
+    ('res_01FBFC', 0x01FBFC),
+    ('res_01F0CD', 0x01F0CD),
+    ('res_02013E', 0x02013E),
+    ('res_0201CC', 0x0201CC),
+    ('res_020286', 0x020286),
+    ('res_0203B8', 0x0203B8),
+    ('res_0201F4', 0x0201F4),
+    ('res_01C5C9', 0x01C5C9),
     # res_01F81D conflicts with far_1F67_01AD at same dump offset - use far version
     # res_01FAE1 conflicts with far_1F67_0471 at same dump offset - use far version
     # res_01F670 conflicts with far_1F67_0000 at same dump offset - use far version
