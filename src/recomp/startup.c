@@ -273,6 +273,15 @@ void res_02A310(CPU *cpu)
     mem_write16(cpu, cpu->ss, 0x583C, cpu->sp);   /* __astkbot */
     mem_write16(cpu, cpu->ss, 0x58B1, cpu->ds);   /* __aintdiv saved DS */
 
+    /*
+     * Step 4b: Initialize MSC CRT FILE struct table.
+     * DS:0x54DA = _lastiob (pointer to last FILE struct in _iob[]).
+     * Must NOT be 0xFFFF. Value 0 = no files open yet, slots available.
+     * DS:0x58EA = stack limit for _chkstk.
+     */
+    mem_write16(cpu, cpu->ds, 0x54DA, 0x0000);
+    mem_write16(cpu, cpu->ds, 0x58EA, 0xF000);
+
     /* Set up the stack frame as MSC expects for main() */
     cpu->bp = 0;
 

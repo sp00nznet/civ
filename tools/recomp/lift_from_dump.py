@@ -218,6 +218,8 @@ DEFAULT_STUBS = [
     # Resident far functions at segment 0x0000 (hot-path display/rendering)
     ('far_0000_1080', 0x0000, 0x1080),
     ('far_0000_11FA', 0x0000, 0x11FA),
+    # File buffer fill function (called indirectly from PIC decoder)
+    ('far_1FB6_0642', 0x1FB6, 0x0642),
     # MSC CRT file I/O functions
     ('far_205A_019C', 0x205A, 0x019C),
     ('far_205A_257C', 0x205A, 0x257C),
@@ -234,9 +236,7 @@ NEAR_STUBS = [
     # res_01C524 conflicts with far_1B05_14D4 at same dump offset - use far version
     ('res_01C605', 0x01C605),
     ('res_01D221', 0x01D221),
-    # File I/O functions needed for PIC loading
-    ('res_01FB68', 0x01FB68),
-    ('res_01FBFC', 0x01FBFC),
+    # File I/O: res_01FB68 (fopen) and res_01FBFC (fclose) hand-implemented in civ_impl.c
     ('res_01F0CD', 0x01F0CD),
     ('res_02013E', 0x02013E),
     ('res_0201CC', 0x0201CC),

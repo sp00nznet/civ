@@ -24,6 +24,111 @@ extern DosState *get_dos_state(CPU *cpu);
 /* Forward declarations for functions we reference */
 extern void res_020FA0(CPU *cpu);
 
+/* ─── MSC CRT: fopen / fclose ─── */
+/* Hand-implemented to bypass broken CRT internal FILE struct allocation.
+ * MSC 5.x FILE struct layout (8 bytes):
+ *   +0: _ptr  (2) - next char position in buffer
+ *   +2: _cnt  (2) - chars remaining in buffer
+ *   +4: _base (2) - buffer base pointer
+ *   +6: _flag (1) - mode flags (_IOREAD=1, _IOWRT=2, _IONBF=4, _IOMYBUF=8,
+ *                                _IOEOF=0x10, _IOERR=0x20, _IOSTRG=0x40, _IORW=0x80)
+ *   +7: _file (1) - DOS file handle
+ * We allocate FILE structs in a static DS area starting at DS:0xC1A0. */
+#define CIV_FILE_AREA  0xC1A0  /* 8 FILE structs × 8 bytes = 64 bytes */
+#define CIV_FILE_BUFS  0xC1E0  /* 8 read buffers × 512 bytes = 4096 bytes */
+#define CIV_FILE_MAX   8
+#define CIV_FILE_BUFSZ 512
+
+void res_01FB68(CPU *cpu) {
+    /* Args: [sp+4]=filename_ptr, [sp+6]=mode (0=read binary) */
+    uint16_t fn_off = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
+
+    /* Build path string */
+    char path[256];
+    int i;
+    for (i = 0; i < 255; i++) {
+        uint8_t c = mem_read8(cpu, cpu->ds, (uint16_t)(fn_off + i));
+        path[i] = (char)c;
+        if (!c) break;
+    }
+    path[255] = 0;
+
+    /* Open via DOS INT 21h/AH=3D (read-only) */
+    DosState *dos = get_dos_state(cpu);
+    uint16_t saved_ax = cpu->ax, saved_bx = cpu->bx;
+    uint16_t saved_cx = cpu->cx, saved_dx = cpu->dx;
+    uint16_t saved_flags = cpu->flags;
+
+    cpu->ah = 0x3D; cpu->al = 0x00; /* open read-only */
+    cpu->dx = fn_off; /* DS:DX = filename */
+    dos_int21(cpu);
+
+    if (cpu->flags & FLAG_CF) {
+        /* Open failed */
+        fprintf(stderr, "[FOPEN] '%s' FAILED\n", path);
+        cpu->ax = 0; /* return NULL */
+        cpu->bx = saved_bx; cpu->cx = saved_cx; cpu->dx = saved_dx;
+        cpu->sp += 4; /* far ret */
+        return;
+    }
+
+    uint8_t handle = (uint8_t)(cpu->ax & 0xFF);
+
+    /* Find a free FILE slot */
+    int slot = -1;
+    for (int s = 0; s < CIV_FILE_MAX; s++) {
+        uint16_t file_off = CIV_FILE_AREA + s * 8;
+        uint8_t flag = mem_read8(cpu, cpu->ds, (uint16_t)(file_off + 6));
+        if (flag == 0) { slot = s; break; }
+    }
+    if (slot < 0) {
+        fprintf(stderr, "[FOPEN] '%s' no free FILE slots\n", path);
+        cpu->ah = 0x3E; cpu->bx = handle; dos_int21(cpu); /* close */
+        cpu->ax = 0;
+        cpu->bx = saved_bx; cpu->cx = saved_cx; cpu->dx = saved_dx;
+        cpu->sp += 4;
+        return;
+    }
+
+    /* Initialize FILE struct */
+    uint16_t file_off = CIV_FILE_AREA + slot * 8;
+    uint16_t buf_off = CIV_FILE_BUFS + slot * CIV_FILE_BUFSZ;
+    mem_write16(cpu, cpu->ds, (uint16_t)(file_off + 0), buf_off);  /* _ptr = buffer start */
+    mem_write16(cpu, cpu->ds, (uint16_t)(file_off + 2), 0);         /* _cnt = 0 (empty buffer) */
+    mem_write16(cpu, cpu->ds, (uint16_t)(file_off + 4), buf_off);  /* _base = buffer start */
+    mem_write8(cpu, cpu->ds, (uint16_t)(file_off + 6), 0x09);       /* _flag = _IOREAD|_IOMYBUF */
+    mem_write8(cpu, cpu->ds, (uint16_t)(file_off + 7), handle);    /* _file = DOS handle */
+
+    /* Store as current FILE for the game's PIC decoder */
+    mem_write16(cpu, cpu->ds, 0x54DA, file_off);
+
+    fprintf(stderr, "[FOPEN] '%s' -> handle %d, FILE* at DS:%04X, buf DS:%04X\n",
+            path, handle, file_off, buf_off);
+
+    cpu->ax = file_off; /* return FILE* (DS offset) */
+    cpu->bx = saved_bx; cpu->cx = saved_cx; cpu->dx = saved_dx;
+    cpu->sp += 4; /* far ret */
+}
+
+/* res_01FBFC - fclose */
+void res_01FBFC(CPU *cpu) {
+    uint16_t file_off = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
+    if (file_off >= CIV_FILE_AREA && file_off < CIV_FILE_AREA + CIV_FILE_MAX * 8) {
+        uint8_t handle = mem_read8(cpu, cpu->ds, (uint16_t)(file_off + 7));
+        /* Close DOS file */
+        uint16_t saved_ax = cpu->ax, saved_bx = cpu->bx;
+        cpu->ah = 0x3E; cpu->bx = handle;
+        dos_int21(cpu);
+        cpu->ax = saved_ax; cpu->bx = saved_bx;
+        /* Clear FILE struct */
+        for (int i = 0; i < 8; i++)
+            mem_write8(cpu, cpu->ds, (uint16_t)(file_off + i), 0);
+        fprintf(stderr, "[FCLOSE] FILE* DS:%04X handle %d\n", file_off, handle);
+    }
+    cpu->ax = 0;
+    cpu->sp += 4; /* far ret */
+}
+
 /* ─── MSC CRT: getch() ─── */
 /* far_205A_20AA - Read a character from keyboard without echo.
  * Blocking: pumps SDL event loop while waiting for input.
@@ -545,11 +650,19 @@ void ovl07_035B6E(CPU *cpu)
 void far_205A_30E4(CPU *cpu)
 {
     uint16_t sp = (uint16_t)(cpu->sp + 4);
-    uint16_t handle    = mem_read16(cpu, cpu->ss, sp);
+    uint16_t handle_or_fp = mem_read16(cpu, cpu->ss, sp);
     uint16_t buf_off   = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 2));
     uint16_t buf_seg   = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 4));
     uint16_t size      = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 6));
     uint16_t res_ptr   = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 8));
+
+    /* The first arg may be a DOS handle (small int) or a FILE* (DS offset).
+     * MSC _dos_read takes a handle, but callers sometimes pass FILE*.
+     * If the value looks like a FILE* (>= CIV_FILE_AREA), extract the handle. */
+    uint16_t handle = handle_or_fp;
+    if (handle_or_fp >= CIV_FILE_AREA && handle_or_fp < CIV_FILE_AREA + CIV_FILE_MAX * 8) {
+        handle = mem_read8(cpu, cpu->ds, (uint16_t)(handle_or_fp + 7)); /* _file field */
+    }
 
     DosState *dos = get_dos_state(cpu);
     uint16_t got = 0;
@@ -559,7 +672,12 @@ void far_205A_30E4(CPU *cpu)
         if (dest + size <= MEM_SIZE) {
             size_t n = fread(cpu->mem + dest, 1, size, dos->file_table.files[handle]);
             got = (uint16_t)n;
+            static int rc = 0; rc++;
+            if (rc <= 20) fprintf(stderr, "[READ] h=%d %u bytes -> %zu\n", handle, size, n);
         }
+    } else {
+        static int fc = 0; fc++;
+        if (fc <= 5) fprintf(stderr, "[READ] FAIL: handle_or_fp=%04X handle=%d\n", handle_or_fp, handle);
     }
 
     /* Store result at SS:result_ptr */
