@@ -320,7 +320,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 
 **Recompilation Results:**
 ```
-  Functions:     482 resident/overlay + 175 dump-lifted = 657 total
+  Functions:     482 resident/overlay + 190 dump-lifted = 672 total
   Instructions:  106,935+ (resident/overlay)
   Code bytes:    280,991 (274.4 KB) resident/overlay + dump-lifted code
   Output:        ~150K lines of C across 10 recomp files + dump_lifted + impl + stubs
@@ -418,22 +418,44 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [x] Resident rendering functions lifted: res_01C813, res_01C605, res_01D221 (NEAR)
 - [x] Pipeline improvements: recomp.py excludes dump-lifted funcs from stubs without affecting recomp output
 - [x] Thunk table deep analysis: 7-byte entries, overlay manager init at 0x0B60, descriptor patching
-- [ ] World gen hang: game stuck after phase 5 (likely input wait or timer issue)
-- [ ] Page flip / display copy (far_0000_07E6 still stubbed — back buffer not visible)
-- [ ] Thunk-to-overlay mapping (far_0000_07E6, far_0000_083F still unresolved)
-- [ ] File I/O completion (fonts.cv, .pic loading needs full CRT read chain)
+- [x] **World gen hang fixed** — 6 bugs in ovl07_034412: 4 missing gotos, 2 broken jump tables
+- [x] Near-far alias pattern for conflicting functions
 
-### Phase 8 — Rendering & Game Data
+### Phase 8 — World Gen Fix & Thunk Resolution
 
-- [ ] Page flip implementation (page 1 → page 0 display copy)
-- [ ] .PIC image loader (LZW decompression implemented, loading chain needed)
+- [x] **World generation completes successfully** (30-60 seconds depending on random seed)
+- [x] Fixed 4 missing `goto` statements (lifter converted `jmp` to comments)
+- [x] Fixed 2 broken indirect jump tables (CS:0x272 and CS:0x518)
+- [x] Removed ~20 lines of garbage code (jump table data decoded as x86 instructions)
+- [x] Created `patch_worldgen.py` for automatic post-recomp patching
+- [x] Auto-inject Space key to advance past "press any key" screens
+
+### Phase 9 — Thunk Resolution & Display
+
+- [x] Resolved 7 thunk table entries to overlay functions
+- [x] Lifted 16+ new functions from dump (display, CRT file I/O)
+- [x] Implemented `_aFchkstk` (far stack check) and buffer write subroutines
+- [x] Minimap rendering with page-flip animation working (10 BLIT operations)
+- [x] DELAY timing function active — game animates between frames
+
+### Phase 10 — File I/O Pipeline *(current)*
+
+- [x] Hand-implemented fopen/fclose with MSC FILE struct setup
+- [x] Lifted file buffer fill function (`far_1FB6_0642`)
+- [x] Fixed 10 UNHANDLED indirect calls in PIC decoder (`call far [DS:E84A]`)
+- [x] Fixed `_dos_read` to handle FILE* as well as raw DOS handles
+- [x] Initialized CRT _lastiob and stack limit in startup
+- [x] **PIC file loading working** — sp299.pic and planet2.pic read successfully (512B chunks)
+- [x] 34 file open operations, 32 close operations in a single run
+- [x] Game progresses past civilization selection into new game setup
+- [ ] 4th recursive planet2.pic read fails (FILE struct corruption under investigation)
 - [ ] .PAL palette loader
 - [ ] .CV font renderer
+
+### Phase 11 — Gameplay
+
 - [ ] Map tile rendering
 - [ ] UI chrome rendering
-
-### Phase 9 — Gameplay
-
 - [ ] Menu navigation (New Game / Load / Earth / Custom)
 - [ ] City management screen
 - [ ] Diplomacy screens
