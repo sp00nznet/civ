@@ -34,8 +34,8 @@ extern void res_020FA0(CPU *cpu);
  *                                _IOEOF=0x10, _IOERR=0x20, _IOSTRG=0x40, _IORW=0x80)
  *   +7: _file (1) - DOS file handle
  * We allocate FILE structs in a static DS area starting at DS:0xC1A0. */
-#define CIV_FILE_AREA  0xC1A0  /* 8 FILE structs × 8 bytes = 64 bytes */
-#define CIV_FILE_BUFS  0xC1E0  /* 8 read buffers × 512 bytes = 4096 bytes */
+#define CIV_FILE_AREA  0xF200  /* 8 FILE structs × 8 bytes = 64 bytes, safe area in BSS */
+#define CIV_FILE_BUFS  0xF240  /* 8 read buffers × 512 bytes = 4096 bytes */
 #define CIV_FILE_MAX   8
 #define CIV_FILE_BUFSZ 512
 
@@ -657,11 +657,27 @@ void far_205A_30E4(CPU *cpu)
     uint16_t res_ptr   = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 8));
 
     /* The first arg may be a DOS handle (small int) or a FILE* (DS offset).
-     * MSC _dos_read takes a handle, but callers sometimes pass FILE*.
-     * If the value looks like a FILE* (>= CIV_FILE_AREA), extract the handle. */
+     * MSC _dos_read takes a handle, but the game's custom I/O passes FILE*.
+     * Extract handle from FILE struct if the value looks like a pointer. */
     uint16_t handle = handle_or_fp;
     if (handle_or_fp >= CIV_FILE_AREA && handle_or_fp < CIV_FILE_AREA + CIV_FILE_MAX * 8) {
         handle = mem_read8(cpu, cpu->ds, (uint16_t)(handle_or_fp + 7)); /* _file field */
+    } else if (handle_or_fp > 20) {
+        /* Not a valid handle and not in our FILE area - use current file
+         * from DS:0x686C (game's stored FILE*) */
+        uint16_t fp = mem_read16(cpu, cpu->ds, 0x686C);
+        if (fp >= CIV_FILE_AREA && fp < CIV_FILE_AREA + CIV_FILE_MAX * 8) {
+            handle = mem_read8(cpu, cpu->ds, (uint16_t)(fp + 7));
+        } else {
+            /* DS:0x686C might have been set to the FILE* but our area check failed.
+             * The FILE* might be from the CRT's own _iob area. Try to find any
+             * open file with matching handle in our table. */
+            for (int s = 0; s < CIV_FILE_MAX; s++) {
+                uint16_t fo = CIV_FILE_AREA + s * 8;
+                uint8_t fl = mem_read8(cpu, cpu->ds, (uint16_t)(fo + 6));
+                if (fl != 0) { handle = mem_read8(cpu, cpu->ds, (uint16_t)(fo + 7)); break; }
+            }
+        }
     }
 
     DosState *dos = get_dos_state(cpu);
@@ -677,7 +693,19 @@ void far_205A_30E4(CPU *cpu)
         }
     } else {
         static int fc = 0; fc++;
-        if (fc <= 5) fprintf(stderr, "[READ] FAIL: handle_or_fp=%04X handle=%d\n", handle_or_fp, handle);
+        if (fc <= 5) {
+            fprintf(stderr, "[READ] FAIL: hfp=%04X handle=%d 686C=%04X\n",
+                    handle_or_fp, handle, mem_read16(cpu, cpu->ds, 0x686C));
+            if (handle_or_fp >= CIV_FILE_AREA && handle_or_fp < CIV_FILE_AREA + CIV_FILE_MAX * 8) {
+                fprintf(stderr, "[READ] FILE@ %04X: ptr=%04X cnt=%04X base=%04X flag=%02X file=%02X\n",
+                        handle_or_fp,
+                        mem_read16(cpu, cpu->ds, handle_or_fp),
+                        mem_read16(cpu, cpu->ds, (uint16_t)(handle_or_fp + 2)),
+                        mem_read16(cpu, cpu->ds, (uint16_t)(handle_or_fp + 4)),
+                        mem_read8(cpu, cpu->ds, (uint16_t)(handle_or_fp + 6)),
+                        mem_read8(cpu, cpu->ds, (uint16_t)(handle_or_fp + 7)));
+            }
+        }
     }
 
     /* Store result at SS:result_ptr */
