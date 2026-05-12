@@ -26,18 +26,37 @@ extern void res_020FA0(CPU *cpu);
 
 /* ─── MSC CRT: fopen / fclose ─── */
 /* Hand-implemented to bypass broken CRT internal FILE struct allocation.
- * MSC 5.x FILE struct layout (8 bytes):
- *   +0: _ptr  (2) - next char position in buffer
- *   +2: _cnt  (2) - chars remaining in buffer
- *   +4: _base (2) - buffer base pointer
- *   +6: _flag (1) - mode flags (_IOREAD=1, _IOWRT=2, _IONBF=4, _IOMYBUF=8,
- *                                _IOEOF=0x10, _IOERR=0x20, _IOSTRG=0x40, _IORW=0x80)
- *   +7: _file (1) - DOS file handle
- * We allocate FILE structs in a static DS area starting at DS:0xC1A0. */
-#define CIV_FILE_AREA  0xF200  /* 8 FILE structs × 8 bytes = 64 bytes, safe area in BSS */
-#define CIV_FILE_BUFS  0xF240  /* 8 read buffers × 512 bytes = 4096 bytes */
-#define CIV_FILE_MAX   8
-#define CIV_FILE_BUFSZ 512
+ *
+ * The FILE struct does NOT live in the guest's DS — the game allocates
+ * a runtime stack that overruns its declared BSS boundary, so any DS
+ * offset within ~0xEB00..0xFFEE gets clobbered by stack writes during
+ * deeply-recursive code paths (e.g. the planet2.pic civ-select dialog).
+ *
+ * Instead we keep FILE state in a host-side table and hand the game an
+ * opaque token (0xF200 | slot) as the FILE*. Lifted code never reads
+ * FILE fields directly — only our own fread/fclose dereference, and
+ * they go through the host table.
+ */
+#define CIV_FILE_MAX     8
+#define CIV_FILE_TOKEN_BASE 0xF200   /* token = base | (slot*8); not a real DS offset */
+
+typedef struct {
+    uint8_t  dos_handle;
+    uint8_t  in_use;
+} CivFileSlot;
+
+static CivFileSlot g_civ_files[CIV_FILE_MAX];
+
+static int civ_file_token_to_slot(uint16_t tok) {
+    if ((tok & 0xFFC7) != CIV_FILE_TOKEN_BASE) return -1; /* not our token */
+    int slot = (tok >> 3) & 0x07;
+    if (!g_civ_files[slot].in_use) return -1;
+    return slot;
+}
+
+static uint16_t civ_file_slot_to_token(int slot) {
+    return (uint16_t)(CIV_FILE_TOKEN_BASE | (slot * 8));
+}
 
 void res_01FB68(CPU *cpu) {
     /* Args: [sp+4]=filename_ptr, [sp+6]=mode (0=read binary) */
@@ -55,16 +74,14 @@ void res_01FB68(CPU *cpu) {
 
     /* Open via DOS INT 21h/AH=3D (read-only) */
     DosState *dos = get_dos_state(cpu);
-    uint16_t saved_ax = cpu->ax, saved_bx = cpu->bx;
+    uint16_t saved_bx = cpu->bx;
     uint16_t saved_cx = cpu->cx, saved_dx = cpu->dx;
-    uint16_t saved_flags = cpu->flags;
 
     cpu->ah = 0x3D; cpu->al = 0x00; /* open read-only */
     cpu->dx = fn_off; /* DS:DX = filename */
     dos_int21(cpu);
 
     if (cpu->flags & FLAG_CF) {
-        /* Open failed */
         fprintf(stderr, "[FOPEN] '%s' FAILED\n", path);
         cpu->ax = 0; /* return NULL */
         cpu->bx = saved_bx; cpu->cx = saved_cx; cpu->dx = saved_dx;
@@ -74,12 +91,10 @@ void res_01FB68(CPU *cpu) {
 
     uint8_t handle = (uint8_t)(cpu->ax & 0xFF);
 
-    /* Find a free FILE slot */
+    /* Find a free slot in the host-side table */
     int slot = -1;
     for (int s = 0; s < CIV_FILE_MAX; s++) {
-        uint16_t file_off = CIV_FILE_AREA + s * 8;
-        uint8_t flag = mem_read8(cpu, cpu->ds, (uint16_t)(file_off + 6));
-        if (flag == 0) { slot = s; break; }
+        if (!g_civ_files[s].in_use) { slot = s; break; }
     }
     if (slot < 0) {
         fprintf(stderr, "[FOPEN] '%s' no free FILE slots\n", path);
@@ -90,40 +105,35 @@ void res_01FB68(CPU *cpu) {
         return;
     }
 
-    /* Initialize FILE struct */
-    uint16_t file_off = CIV_FILE_AREA + slot * 8;
-    uint16_t buf_off = CIV_FILE_BUFS + slot * CIV_FILE_BUFSZ;
-    mem_write16(cpu, cpu->ds, (uint16_t)(file_off + 0), buf_off);  /* _ptr = buffer start */
-    mem_write16(cpu, cpu->ds, (uint16_t)(file_off + 2), 0);         /* _cnt = 0 (empty buffer) */
-    mem_write16(cpu, cpu->ds, (uint16_t)(file_off + 4), buf_off);  /* _base = buffer start */
-    mem_write8(cpu, cpu->ds, (uint16_t)(file_off + 6), 0x09);       /* _flag = _IOREAD|_IOMYBUF */
-    mem_write8(cpu, cpu->ds, (uint16_t)(file_off + 7), handle);    /* _file = DOS handle */
+    g_civ_files[slot].dos_handle = handle;
+    g_civ_files[slot].in_use     = 1;
 
-    /* Store as current FILE for the game's PIC decoder */
-    mem_write16(cpu, cpu->ds, 0x54DA, file_off);
+    uint16_t token = civ_file_slot_to_token(slot);
 
-    fprintf(stderr, "[FOPEN] '%s' -> handle %d, FILE* at DS:%04X, buf DS:%04X\n",
-            path, handle, file_off, buf_off);
+    /* Store as current FILE for the game's PIC decoder fallback path. */
+    mem_write16(cpu, cpu->ds, 0x54DA, token);
 
-    cpu->ax = file_off; /* return FILE* (DS offset) */
+    fprintf(stderr, "[FOPEN] '%s' -> handle %d, token %04X (slot %d)\n",
+            path, handle, token, slot);
+
+    cpu->ax = token;
     cpu->bx = saved_bx; cpu->cx = saved_cx; cpu->dx = saved_dx;
     cpu->sp += 4; /* far ret */
 }
 
 /* res_01FBFC - fclose */
 void res_01FBFC(CPU *cpu) {
-    uint16_t file_off = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
-    if (file_off >= CIV_FILE_AREA && file_off < CIV_FILE_AREA + CIV_FILE_MAX * 8) {
-        uint8_t handle = mem_read8(cpu, cpu->ds, (uint16_t)(file_off + 7));
-        /* Close DOS file */
+    uint16_t token = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
+    int slot = civ_file_token_to_slot(token);
+    if (slot >= 0) {
+        uint8_t handle = g_civ_files[slot].dos_handle;
         uint16_t saved_ax = cpu->ax, saved_bx = cpu->bx;
         cpu->ah = 0x3E; cpu->bx = handle;
         dos_int21(cpu);
         cpu->ax = saved_ax; cpu->bx = saved_bx;
-        /* Clear FILE struct */
-        for (int i = 0; i < 8; i++)
-            mem_write8(cpu, cpu->ds, (uint16_t)(file_off + i), 0);
-        fprintf(stderr, "[FCLOSE] FILE* DS:%04X handle %d\n", file_off, handle);
+        g_civ_files[slot].in_use = 0;
+        g_civ_files[slot].dos_handle = 0;
+        fprintf(stderr, "[FCLOSE] token %04X handle %d (slot %d)\n", token, handle, slot);
     }
     cpu->ax = 0;
     cpu->sp += 4; /* far ret */
@@ -656,26 +666,26 @@ void far_205A_30E4(CPU *cpu)
     uint16_t size      = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 6));
     uint16_t res_ptr   = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 8));
 
-    /* The first arg may be a DOS handle (small int) or a FILE* (DS offset).
-     * MSC _dos_read takes a handle, but the game's custom I/O passes FILE*.
-     * Extract handle from FILE struct if the value looks like a pointer. */
+    /* The first arg may be a small DOS handle, our FILE* token, or some
+     * garbage (e.g. lifted code that uses _lastiob indirectly). Resolve
+     * via the host-side table when it looks like a token. */
     uint16_t handle = handle_or_fp;
-    if (handle_or_fp >= CIV_FILE_AREA && handle_or_fp < CIV_FILE_AREA + CIV_FILE_MAX * 8) {
-        handle = mem_read8(cpu, cpu->ds, (uint16_t)(handle_or_fp + 7)); /* _file field */
+    int slot = civ_file_token_to_slot(handle_or_fp);
+    if (slot >= 0) {
+        handle = g_civ_files[slot].dos_handle;
     } else if (handle_or_fp > 20) {
-        /* Not a valid handle and not in our FILE area - use current file
-         * from DS:0x686C (game's stored FILE*) */
+        /* Try DS:0x686C (game's stored "current FILE") */
         uint16_t fp = mem_read16(cpu, cpu->ds, 0x686C);
-        if (fp >= CIV_FILE_AREA && fp < CIV_FILE_AREA + CIV_FILE_MAX * 8) {
-            handle = mem_read8(cpu, cpu->ds, (uint16_t)(fp + 7));
+        slot = civ_file_token_to_slot(fp);
+        if (slot >= 0) {
+            handle = g_civ_files[slot].dos_handle;
         } else {
-            /* DS:0x686C might have been set to the FILE* but our area check failed.
-             * The FILE* might be from the CRT's own _iob area. Try to find any
-             * open file with matching handle in our table. */
+            /* Last resort: any open slot */
             for (int s = 0; s < CIV_FILE_MAX; s++) {
-                uint16_t fo = CIV_FILE_AREA + s * 8;
-                uint8_t fl = mem_read8(cpu, cpu->ds, (uint16_t)(fo + 6));
-                if (fl != 0) { handle = mem_read8(cpu, cpu->ds, (uint16_t)(fo + 7)); break; }
+                if (g_civ_files[s].in_use) {
+                    handle = g_civ_files[s].dos_handle;
+                    break;
+                }
             }
         }
     }
@@ -694,17 +704,8 @@ void far_205A_30E4(CPU *cpu)
     } else {
         static int fc = 0; fc++;
         if (fc <= 5) {
-            fprintf(stderr, "[READ] FAIL: hfp=%04X handle=%d 686C=%04X\n",
-                    handle_or_fp, handle, mem_read16(cpu, cpu->ds, 0x686C));
-            if (handle_or_fp >= CIV_FILE_AREA && handle_or_fp < CIV_FILE_AREA + CIV_FILE_MAX * 8) {
-                fprintf(stderr, "[READ] FILE@ %04X: ptr=%04X cnt=%04X base=%04X flag=%02X file=%02X\n",
-                        handle_or_fp,
-                        mem_read16(cpu, cpu->ds, handle_or_fp),
-                        mem_read16(cpu, cpu->ds, (uint16_t)(handle_or_fp + 2)),
-                        mem_read16(cpu, cpu->ds, (uint16_t)(handle_or_fp + 4)),
-                        mem_read8(cpu, cpu->ds, (uint16_t)(handle_or_fp + 6)),
-                        mem_read8(cpu, cpu->ds, (uint16_t)(handle_or_fp + 7)));
-            }
+            fprintf(stderr, "[READ] FAIL: hfp=%04X handle=%d 686C=%04X slot=%d\n",
+                    handle_or_fp, handle, mem_read16(cpu, cpu->ds, 0x686C), slot);
         }
     }
 
