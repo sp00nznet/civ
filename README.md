@@ -400,7 +400,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [x] Keyboard input polling (KBHIT via SDL2)
 - [x] Timer speed multiplier (20x) for faster animation playback
 
-### Phase 7 — EXEPACK Code Lifting & CRT *(current)*
+### Phase 7 — EXEPACK Code Lifting & CRT
 
 - [x] Decompressed memory dump tool (startup.c dumps civ_decompressed.bin at runtime)
 - [x] **lift_from_dump.py** — lifts functions from decompressed dump for EXEPACK-compressed code
@@ -438,7 +438,7 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [x] Minimap rendering with page-flip animation working (10 BLIT operations)
 - [x] DELAY timing function active — game animates between frames
 
-### Phase 10 — File I/O Pipeline *(current)*
+### Phase 10 — File I/O Pipeline
 
 - [x] Hand-implemented fopen/fclose with MSC FILE struct setup
 - [x] Lifted file buffer fill function (`far_1FB6_0642`)
@@ -448,24 +448,56 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [x] **PIC file loading working** — sp299.pic and planet2.pic read successfully (512B chunks)
 - [x] 34 file open operations, 32 close operations in a single run
 - [x] Game progresses past civilization selection into new game setup
-- [ ] 4th recursive planet2.pic read fails (FILE struct corruption under investigation)
-- [ ] .PAL palette loader
-- [ ] .CV font renderer
+- [x] FILE struct corruption fixed — moved FILE state to a host-side table, `fopen`
+      returns an opaque token (`0xF200 | slot*8`) instead of an in-DS FILE struct
 
-### Phase 11 — Gameplay
+### Phase 12 — Overlay Thunk Bugs & Terrain Reveal
 
+- [x] **Fixed the civ-select infinite recursion** — `far_0000_076F` was wrongly
+      aliased to its own caller `ovl02_02CDD7` (the dialog), re-entering the whole
+      dialog 24×/cell and exhausting the stack. It's a screen-grab→sprite-handle
+      primitive; hand-implemented. planet2.pic opens dropped 32 → 0.
+- [x] **Reverse-engineered the overlay thunk-binding mechanism** — the `0x0761`
+      vectors are runtime-patched from per-overlay descriptors (`0x0B62` via DOS
+      `4B03`), so the naive "overlay functions in link order" alias map is
+      unreliable; suspect thunks must be verified by contract.
+- [x] **Un-stubbed `ovl07_035B6E`** (terrain-reveal state machine) via the project
+      lifter — fixed an infinite spin (**CPU 98% → ~8%**); the game now advances
+      past the reveal into world-gen map writes.
+
+### Phase 13 — Rendering On Screen
+
+- [x] Diagnosed the black-screen pipeline (mode 13h OK; `platform_render` correct)
+- [x] **Implemented the string renderer `far_0000_07F4`** (was mis-aliased to
+      `ovl05_0307DA`) as an 8×8 CP437 text blit — **real game text now renders on
+      screen** (verified: `_kills: NONE` in cyan via `PrintWindow`)
+- [x] Capture note: GDI `BitBlt` shows SDL's GPU window as black; use
+      `PrintWindow(PW_RENDERFULLCONTENT)` or the env-gated `CIV_RENDERDIAG` fb dump
+- [ ] Map tile / sprite blitter `far_0000_083F` (stub; reached only past the menu)
+- [ ] DAC palette upload (text shows via the default palette for now)
+
+### Phase 14 — Boot Flow & MSC CRT Text I/O
+
+- [x] Found the real boot flow (logos/title/menu) was *bypassed*, not missing —
+      un-bypassing `ovl02_02C200` runs the real intro (loads `logo.pic`,
+      `birth0/1.pic`, `credits.txt`)
+- [x] **Implemented the MSC 5.x CRT text-stream chain** (`getc` `res_021BC8`,
+      `ungetc` `far_215A_16DA`, width-check `res_021C22`, skip-ws `res_021BEC`,
+      scanf field reader `res_02178A`) against the host FILE table — the 79M-call
+      credits-parse spin is **gone**; `credits.txt` now parses
+- [ ] Bad-filename pointer bug after credits (opens a stray DGROUP message string)
+      — next blocker to the interactive title/menu
+
+### Phase 15 — Gameplay
+
+- [ ] Title screen + main menu (New Game / Load / Earth / Custom)
 - [ ] Map tile rendering
 - [ ] UI chrome rendering
-- [ ] Menu navigation (New Game / Load / Earth / Custom)
-- [ ] City management screen
-- [ ] Diplomacy screens
-- [ ] Combat resolution
-- [ ] Technology tree
-- [ ] Wonder screens
+- [ ] City management / diplomacy / combat / tech tree / wonders
 - [ ] Save/load game state
 - [ ] Hall of Fame
 
-### Phase 10 — Audio & Polish
+### Phase 16 — Audio & Polish
 
 - [ ] .CVL sound data loader
 - [ ] SDL2 audio output (AdLib OPL2 synthesis or PCM playback)

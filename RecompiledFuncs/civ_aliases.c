@@ -44,10 +44,20 @@ extern void ovl05_0307DA(CPU *cpu);  /* entry 21 */
 extern void ovl07_0349D4(CPU *cpu);  /* entry 38 */
 extern void ovl12_03D15C(CPU *cpu);  /* entry 91 */
 
-void far_0000_076F(CPU *cpu) { ovl02_02CDD7(cpu); }
+/* far_0000_076F is NOT ovl02_02CDD7 (that alias caused infinite recursion:
+ * the civ-select dialog ovl02_02CDD7 calls 0x076F 24x in a grid loop, so
+ * aliasing it to itself re-entered the whole dialog every iteration, dropping
+ * SP ~0x258/level until the stack/FILE area was exhausted). The thunk-table
+ * 0x0761 entries are runtime-patched from per-overlay descriptors, so the
+ * naive "overlay functions in order" assignment is unreliable. 0x076F is a
+ * screen-grab primitive: far_076F(flag, x, y, w, h) captures a w*h rect and
+ * returns a sprite handle later blitted by far_0000_083F. Hand-implemented in
+ * civ_impl.c. See session log 2026-05-30. */
 void far_0000_0776(CPU *cpu) { ovl02_02D72A(cpu); }
 void far_0000_07B5(CPU *cpu) { ovl03_02E45D(cpu); }
 void far_0000_07E6(CPU *cpu) { ovl05_02FFC2(cpu); }
-void far_0000_07F4(CPU *cpu) { ovl05_0307DA(cpu); }
+/* far_0000_07F4 is the string renderer (called by res_001828), NOT
+ * ovl05_0307DA — the sequential thunk assignment mis-mapped it. Hand-
+ * implemented as an 8x8 text blit in civ_impl.c. See session 2026-05-31. */
 void far_0000_086B(CPU *cpu) { ovl07_0349D4(cpu); }
 void far_0000_09DE(CPU *cpu) { ovl12_03D15C(cpu); }

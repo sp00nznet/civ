@@ -280,6 +280,19 @@ void platform_render(Platform *plat, const CPU *cpu, const DosState *dos)
     SDL_RenderClear(ren);
     SDL_RenderCopy(ren, tex, NULL, NULL);
     SDL_RenderPresent(ren);
+
+    if (getenv("CIV_RENDERDIAG")) {
+        static int n = 0; static long maxnz = 0;
+        if (is_gfx) {
+            long nz = 0;
+            const uint8_t *fb = cpu->mem + VGA_FB_ADDR;
+            for (int i = 0; i < VGA_WIDTH*VGA_HEIGHT; i++) if (fb[i]) nz++;
+            if (nz > maxnz) maxnz = nz;
+        }
+        if ((n++ % 60) == 0)
+            fprintf(stderr, "[SDLDIAG] call#%d is_gfx=%d vmode=0x%02X last_mode=%d ren=%p tex_vga=%p maxnz=%ld\n",
+                    n, is_gfx, vmode, plat->last_mode, (void*)ren, (void*)plat->tex_vga, maxnz);
+    }
 }
 
 uint64_t platform_get_ticks(void)

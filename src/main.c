@@ -34,6 +34,53 @@ static void game_poll_callback(void *platform_ctx, void *dos_state, const void *
     platform_poll_events(plat, dos);
     platform_render(plat, c, dos);
 
+    /* [RENDERDIAG] black-screen classification — set env CIV_RENDERDIAG=1 to enable.
+     * Reports video mode, palette richness, and non-zero pixel counts per page. */
+    {
+        static int rd_on = -1;
+        if (rd_on < 0) rd_on = getenv("CIV_RENDERDIAG") ? 1 : 0;
+        static unsigned rd = 0;
+        if (rd_on && (rd++ % 8) == 0) {
+            uint8_t vmode = c->mem[0x449];
+            /* palette entries beyond the default 0-31 that are non-zero */
+            int pal_rich = 0;
+            for (int i = 32; i < 256; i++)
+                if (dos->video.palette[i][0] | dos->video.palette[i][1] | dos->video.palette[i][2])
+                    pal_rich++;
+            /* non-zero pixel counts + page-0 bounding box / sample color */
+            long nzA = 0, nzC = 0, nzD = 0;
+            int minx=320,miny=200,maxx=-1,maxy=-1,sample=0;
+            for (int yy = 0; yy < 200; yy++) for (int xx = 0; xx < 320; xx++) {
+                uint8_t v = c->mem[0xA0000 + yy*320 + xx];
+                if (v) { nzA++; if(xx<minx)minx=xx; if(xx>maxx)maxx=xx; if(yy<miny)miny=yy; if(yy>maxy)maxy=yy; if(!sample)sample=v; }
+                if (c->mem[0xC0000 + yy*320+xx]) nzC++;
+                if (c->mem[0xD0000 + yy*320+xx]) nzD++;
+            }
+            fprintf(stderr,
+                "[RENDERDIAG] #%u vmode=0x%02X pal_rich=%d/224 nzA=%ld(bbox %d,%d..%d,%d col=%d) nzC=%ld nzD=%ld\n",
+                rd, vmode, pal_rich, nzA, minx,miny,maxx,maxy,sample, nzC, nzD);
+            /* Dump page-0 framebuffer (palette-applied) to a PPM once, to verify
+             * content independent of SDL. */
+            static int dumped = 0;
+            if (!dumped && nzA > 100) {
+                dumped = 1;
+                uint32_t rgba2[256]; video_get_rgba_palette(&dos->video, rgba2);
+                FILE *f = fopen("fb_dump.ppm", "wb");
+                if (f) {
+                    fprintf(f, "P6\n320 200\n255\n");
+                    for (int i = 0; i < 320*200; i++) {
+                        uint32_t px = rgba2[c->mem[0xA0000 + i]];
+                        uint8_t rgb[3] = { (uint8_t)px, (uint8_t)(px>>8), (uint8_t)(px>>16) };
+                        fwrite(rgb, 1, 3, f);
+                    }
+                    fclose(f);
+                    fprintf(stderr, "[RENDERDIAG] wrote fb_dump.ppm\n");
+                }
+            }
+            fflush(stderr);
+        }
+    }
+
     /* Keep timer advancing during blocking I/O waits */
     timer_update(&dos->timer, (uint64_t)clock() * 1000ULL / CLOCKS_PER_SEC);
 
