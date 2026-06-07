@@ -82,18 +82,27 @@ headroom on the big heap alloc** so the driver overlays load *below* `A000`, and
 driver loads at `9100`, the sound driver at `A000`, and the game runs the full
 intro (logo/birth/credits) with no divergence.
 
-## Current wall: graphics-driver frame-sync (timer ISR)
+## Driver placement: reclaim over-granted space
 
-After credits the game spins in the MCGA driver at `9100:06c7`
-(`cmp byte [0x440], al; je`) — waiting for a **frame counter the game's hooked
-INT 8 (PIT) handler increments**. Nothing fires INT 8 headless. An IRET chain
-stub for the old vector is installed at `0060:0000`, but firing INT 8 once per
-1 M-instruction slice advances the frame-driven intro too fast and breaks it — it
-needs **pacing to the game's real cadence** (fire ~once per N instructions tuned
-to 18.2 Hz, or only when the frame-wait spin is detected). That's the next step
-to reach the title menu (`king.txt`) and the sp299 load. Diagnostics:
-`--findjump` (trace a wild control transfer), `--spin` (dump a stuck loop),
-`--tracealloc` (single-step the alloc path).
+The avail-floor (needed for the overrun check) makes the game alloc a big block
+for a small driver overlay, over-advancing `mem_free` toward VGA so the *next*
+driver loads at/above A000 (corrupt). Fix: after each `4B03` overlay load, set
+`mem_free` to just past the driver's real image (`load_seg + image + minalloc`),
+so the graphics + sound drivers pack low and contiguous (`4A1C`/`4A3C`/`4BDD`),
+all below A000. No more divergence.
+
+## Current wall: frame-driven intro pacing
+
+After credits the MCGA driver runs its per-frame loop: wait on a frame counter
+`es:[0x440]` (`mgraphic 06c7`), compute timing (`0790`, reads `cs:[0x6b3/6b5]`),
+and a VGA-retrace wait (`07a4`: `in 3DA; test al,8`). The `0x3DA` toggle handles
+retrace; for the frame counter, the harness **bumps `es:[0x440]` when the spin is
+detected** (no timer ISR fires headless) — this advances past that wait into the
+frame loop, but the credits sequence still doesn't auto-advance to the title
+(`king.txt`). It needs the timer paced to the game's real cadence + the right
+input path for the "skip"/advance key (the intro isn't polling INT 16h). That's
+the next step toward the sp299 load. Diagnostics: `--findjump`, `--spin`,
+`--tracealloc`.
 
 ## TODO / next
 

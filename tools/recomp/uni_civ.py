@@ -315,9 +315,18 @@ def main():
                         a = ((load_seg + rseg) & 0xFFFF) * 16 + roff
                         v = (struct.unpack("<H", uc.mem_read(a, 2))[0] + reloc) & 0xFFFF
                         uc.mem_write(a, struct.pack("<H", v))
+                    # Reclaim over-granted space: the avail-floor makes the game
+                    # alloc a big block for a small driver overlay, over-advancing
+                    # mem_free toward VGA so the NEXT driver loads at/above A000
+                    # (corrupt). Set mem_free to just past this driver's real image
+                    # so subsequent driver overlays load right after it, below A000.
+                    ominalloc = struct.unpack_from("<H", ov, 0x0A)[0]
+                    end = load_seg + (oimg + 15) // 16 + ominalloc
+                    if load_seg < MEM_TOP and end <= MEM_TOP:
+                        st["mem_free"] = min(st["mem_free"], end)
                     st.setdefault("ovls", []).append(base)
                     print(f"  [INT21/4B03] loaded overlay '{base}' ({oimg}B) @ seg {load_seg:04X} "
-                          f"reloc {reloc:04X} ({ocrlc} relocs)")
+                          f"reloc {reloc:04X} ({ocrlc} relocs) end={end:04X}")
                     cf(False)
                 else:
                     print(f"  [INT21/4B AL={al:02X}] '{base}' not found / unsupported")
@@ -486,6 +495,16 @@ def main():
         # if the resume point is stuck (same for several slices), disassemble it
         if addr == st.get("last_resume"):
             st["stuck"] = st.get("stuck", 0) + 1
+            # surgical timer: the graphics driver spins on a frame counter at
+            # ES:[0x440] that a timer ISR should advance (mgraphic 06c7:
+            # `cmp es:[0x440],al; je`). Nothing fires the ISR headless, so when
+            # stuck, bump that byte counter directly so the frame-wait exits and
+            # the (frame-driven) intro advances one step.
+            if st["stuck"] >= 2:
+                es = uc.reg_read(R["es"])
+                a = (es << 4) + 0x440
+                uc.mem_write(a, bytes([(uc.mem_read(a, 1)[0] + 1) & 0xFF]))
+                st["stuck"] = 0
             if st["stuck"] == 6 and "--spin" in av:
                 import capstone as _c
                 md = _c.Cs(_c.CS_ARCH_X86, _c.CS_MODE_16)
