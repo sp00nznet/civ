@@ -551,6 +551,14 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
 - [x] **Civilization / difficulty-select screen reached.** With the decode fixed, the
       game grabs the 41×58 leader-portrait sprites from the sheet, loads `arch.pic`
       (throne room) + `back0a.pal`/`sp256.pal`, and builds the `*ARCH` select screen
+- [x] **PIC LZW decoder now pixel-perfect on large images.** A third decoder bug
+      surfaced via the title `logo.pic` (clean top, garbage lower half): the
+      dictionary-full reset wrongly called the full re-init (`0x124E`, which reads a
+      fresh stream word + reseeds the bit buffer) instead of the dict-only reset
+      (`0x1262`). That consumed an extra stream word mid-decode and desynced the
+      bitstream after the first dictionary overflow — corrupting every image large
+      enough to fill the 0x800-entry dictionary (logo / birth / title / arch).
+      Fixed → `logo.pic` decodes the full "Sid Meier's CIVILIZATION" wordmark cleanly
 - [x] **Deterministic New-Game repro** via `CIV_KEYSCRIPT=<chars>` (scripted getkey/
       kbhit) — `CIV_KEYSCRIPT=N` reliably drives New Game → world-gen → sprite decode
 - [ ] Drive the civ-select screen → the real in-game loop (`res_0023F0`)

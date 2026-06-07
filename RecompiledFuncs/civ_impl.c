@@ -4456,7 +4456,32 @@ static uint16_t pic_read_code(CPU *cpu)
     return bx & mask;
 }
 
-/* res_00124E - Reset LZW dictionary when it overflows.
+/* lzw_dict_reset - the dictionary-only reset (original entry 0x1262): set
+ * code_bits=9, max_code=0x1FF, next_free=0x100, clear the 0x800 parent slots and
+ * re-init the 256 single-byte codes. Critically it does NOT read a stream word or
+ * touch the bit buffer (0x6886/0x6888) — the bitstream continues uninterrupted.
+ * Reached two ways in the original: fall-through from res_00124E (after the word
+ * read, init only) and `call 0x1262` from res_0012F6's dict-full path. */
+static void lzw_dict_reset(CPU *cpu)
+{
+    mem_write8(cpu, cpu->ds, 0x6880, 0x9);
+    mem_write16(cpu, cpu->ds, 0x6882, 0x1FF);
+    cpu->dx = 0x100;
+    mem_write16(cpu, cpu->ds, 0x6884, cpu->dx);
+    /* Clear dictionary parent pointers to 0xFFFF (unused) */
+    for (int i = 0; i < 0x800; i++) {
+        mem_write16(cpu, cpu->ds, (uint16_t)((i * 3) + (uint16_t)(-0x36CA & 0xFFFF)), 0xFFFF);
+    }
+    /* Init single-byte codes 0-255 */
+    for (int i = 0; i < 0x100; i++) {
+        mem_write8(cpu, cpu->ds, (uint16_t)((i * 3) + (uint16_t)(-0x36C8 & 0xFFFF)), (uint8_t)i);
+    }
+}
+
+/* res_00124E - LZW (re)init that reads a fresh param word (original 0x124E):
+ * read a 16-bit word from the stream — low byte = max code width (clamped 0x0B),
+ * the word also seeds the bit buffer (bits_avail=8 → only the high byte is data) —
+ * then do the dictionary reset. Used at decode start (via res_001205).
  * Near call (sp += 2 on return). */
 void res_00124E(CPU *cpu)
 {
@@ -4470,18 +4495,7 @@ void res_00124E(CPU *cpu)
     mem_write8(cpu, cpu->ds, 0x6881, cpu->al);
     mem_write16(cpu, cpu->ds, 0x6886, cpu->ax);
     mem_write8(cpu, cpu->ds, 0x6888, 0x8);
-    mem_write8(cpu, cpu->ds, 0x6880, 0x9);
-    mem_write16(cpu, cpu->ds, 0x6882, 0x1FF);
-    cpu->dx = 0x100;
-    mem_write16(cpu, cpu->ds, 0x6884, cpu->dx);
-    /* Clear dictionary parent pointers to 0xFFFF (unused) */
-    for (int i = 0; i < 0x800; i++) {
-        mem_write16(cpu, cpu->ds, (uint16_t)((i * 3) + (uint16_t)(-0x36CA & 0xFFFF)), 0xFFFF);
-    }
-    /* Init single-byte codes 0-255 */
-    for (int i = 0; i < 0x100; i++) {
-        mem_write8(cpu, cpu->ds, (uint16_t)((i * 3) + (uint16_t)(-0x36C8 & 0xFFFF)), (uint8_t)i);
-    }
+    lzw_dict_reset(cpu);
     cpu->sp += 2; /* near ret */
 }
 
@@ -4603,11 +4617,12 @@ void res_0012F6(CPU *cpu)
         cur_bits++;
         uint8_t max_bits = mem_read8(cpu, cpu->ds, 0x6881);
         if ((int8_t)cur_bits > (int8_t)max_bits) {
-            /* Dictionary full - reset (original calls res_00124E at 0x13B0,
-             * then writes [0x688A]=cx afterwards — done once below). */
+            /* Dictionary full - reset. The original calls 0x1262 (dict-only reset)
+             * here, NOT the full res_00124E (0x124E): it must NOT consume a stream
+             * word or reset the bit buffer mid-stream, or the bitstream desyncs and
+             * everything after the first overflow decodes to garbage. */
             mem_write16(cpu, cpu->ds, 0x6884, dx);
-            push16(cpu, 0);
-            res_00124E(cpu);
+            lzw_dict_reset(cpu);
             dx = mem_read16(cpu, cpu->ds, 0x6884);
         } else {
             mem_write8(cpu, cpu->ds, 0x6880, cur_bits);
@@ -4714,7 +4729,7 @@ void res_001284(CPU *cpu)
  * stack base 0x6A8D -> max-width read -> dict init). This was why every PIC
  * (logo/birth/title) opened+read but produced no pixels (screen stayed blank). */
 void res_001219(CPU *cpu) { res_001205(cpu); }  /* LZW state init */
-void res_001262(CPU *cpu) { res_00124E(cpu); }  /* dict reset */
+void res_001262(CPU *cpu) { lzw_dict_reset(cpu); cpu->sp += 2; }  /* dict-only reset (0x1262) */
 void res_001298(CPU *cpu) { res_001284(cpu); }  /* RLE+LZW row decode */
 void res_00130A(CPU *cpu) { res_0012F6(cpu); }  /* LZW next byte */
 
