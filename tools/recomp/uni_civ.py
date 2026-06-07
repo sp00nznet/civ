@@ -289,6 +289,12 @@ def main():
                     uc.reg_write(R["ax"], 0x02); cf(True)   # not found
                 if base.lower() == "credits.txt":
                     st["record"] = 1           # start ring-recording near divergence
+                if base.lower() == "king.txt" and not st.get("kdbg"):
+                    st["kdbg"] = 1
+                    for iv in (0x08, 0x09, 0x16, 0x1C):
+                        p = struct.unpack("<I", uc.mem_read(iv * 4, 4))[0]
+                        print(f"  [IVT] int{iv:02X} -> {p>>16:04x}:{p&0xFFFF:04x}")
+                    print(f"  [KBD] port60 reads so far = {st.get('p60',0)}")
                 if SNAP_OPEN and SNAP_OPEN.lower() in base.lower():
                     dump_ctx(f"open {base}")
                 if STOP_OPEN and STOP_OPEN.lower() in base.lower():
@@ -375,15 +381,18 @@ def main():
             cf(False); return
         if intno == 0x20:
             st["stop"] = "INT 20h"; uc.emu_stop(); return
-        if intno == 0x16:                        # BIOS keyboard
+        if intno == 0x16:                        # BIOS keyboard (buffer-based)
             st["i16"] = st.get("i16", 0) + 1
-            key = next_key(ah in (0x00, 0x10))
-            word = (key[1] << 8) | key[0]
-            if ah in (0x00, 0x10):               # read key (blocking)
-                uc.reg_write(R["ax"], word)
-            elif ah in (0x01, 0x11):             # status -> key available (ZF=0)
-                uc.reg_write(R["ax"], word)
-                uc.reg_write(R["eflags"], uc.reg_read(R["eflags"]) & ~0x40)
+            _d = st.setdefault("i16ah", {}); _d[ah] = _d.get(ah, 0) + 1
+            kbuf = st.setdefault("kbuf", [])
+            if ah in (0x01, 0x11):               # status: ZF=0 + key if buffered
+                if kbuf:
+                    uc.reg_write(R["ax"], kbuf[0])
+                    uc.reg_write(R["eflags"], uc.reg_read(R["eflags"]) & ~0x40)
+                else:
+                    uc.reg_write(R["eflags"], uc.reg_read(R["eflags"]) | 0x40)  # ZF=1 none
+            elif ah in (0x00, 0x10):             # read: pop one (don't flood)
+                uc.reg_write(R["ax"], kbuf.pop(0) if kbuf else 0)
             return
         if intno == 0x1A and ah == 0x00:         # get system time -> CX:DX ticks
             t = st["ticks"]
@@ -465,8 +474,9 @@ def main():
             if phase < period * 0.13: v |= 0x08   # vertical retrace
             if phase < period * 0.16: v |= 0x01   # display-disable
             return v
-        if port == 0x60:                 # keyboard data port
-            return 0x39                  # space scancode
+        if port == 0x60:                 # keyboard data port (scancode)
+            st["p60"] = st.get("p60", 0) + 1
+            return st.get("kbd_scan", 0x39)
         return 0xFF
 
     if TRACE:                       # per-instruction hook is the perf bottleneck
@@ -495,6 +505,19 @@ def main():
         if uc.reg_read(R["cs"]) == st.get("gfx_seg") and st.get("record"):
             es = uc.reg_read(R["es"]); a = (es << 4) + 0x440
             uc.mem_write(a, bytes([(uc.mem_read(a, 1)[0] + 1) & 0xFF]))
+        # At the title/menu (king.txt loaded), the game waits on keys via its own
+        # INT 9 keyboard handler (not INT 16h). Inject scripted scancodes through
+        # it every few slices: 'n' (New Game) then Enter to take setup defaults
+        # toward the sp299 load.
+        # At the title/menu (king.txt loaded) the game polls INT 16h for keys.
+        # Feed one scripted key per slice via the BIOS-keyboard buffer (kbuf) so
+        # the menu isn't flooded: 'n' (New Game) then Enter to take setup defaults.
+        if len(st["opens"]) >= 11 and st.get("slice", 0) % 3 == 0:
+            kbuf = st.setdefault("kbuf", [])
+            if not kbuf:
+                MENU = [(0x31 << 8) | 0x6E] + [(0x1C << 8) | 0x0D] * 16  # n, Enter...
+                ki = st.get("ki9", 0); st["ki9"] = ki + 1
+                kbuf.append(MENU[ki] if ki < len(MENU) else (0x1C << 8) | 0x0D)
         # NOTE: the game hooks INT 8 (PIT) and its graphics driver waits on a
         # frame counter that handler increments (spin at mgraphic 9100:06c7,
         # `cmp [0x440],al; je`). Firing INT 8 every slice here advances the
@@ -541,8 +564,22 @@ def main():
     print(f"\nstopped: {st.get('stop') or 'instruction cap'} after ~{done} insns, "
           f"{st['ovl']} INT3F overlay calls, {st['ticks']} ticks")
     print("  file opens:", st["opens"])
-    print(f"  INT16 calls={st.get('i16',0)} keys-consumed={st.get('ki',0)} "
-          f"video-modes={st.get('modes',[])}")
+    print(f"  INT16 calls={st.get('i16',0)} AH-breakdown={st.get('i16ah',{})} "
+          f"keys-pushed={st.get('ki9',0)}")
+    # dump the MCGA mode-13h framebuffer (A0000, 320x200x8) so we can SEE graphics
+    # screens (menu/map). No DAC palette emulated -> write a grayscale-ish PPM
+    # keyed on the index so structure is visible.
+    fb = bytes(uc.mem_read(0xA0000, 320 * 200))
+    nz = sum(1 for b in fb if b)
+    print(f"  [FB13] A0000 nonzero={nz}/64000")
+    if nz > 200:
+        os.makedirs("work", exist_ok=True)
+        with open("work/uni_fb13.ppm", "wb") as f:
+            f.write(b"P6\n320 200\n255\n")
+            for b in fb:
+                # spread index across RGB so distinct colors are distinguishable
+                f.write(bytes([(b * 7) & 0xFF, (b * 3) & 0xFF, (b * 5) & 0xFF]))
+        print("  wrote work/uni_fb13.ppm")
     # dump the text-mode screen (0xB8000, 80x25, char in even bytes) so we can SEE
     # which text screen the game is on and feed the right keys.
     print("  --- text screen (B8000) ---")
