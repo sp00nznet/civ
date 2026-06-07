@@ -291,7 +291,10 @@ void far_0000_09DE(CPU *cpu)
     { const char *ks = getenv("CIV_KEYSCRIPT");
       if (ks && ks[0]) {
         static unsigned ksi = 0;
-        char c = ks[ksi] ? ks[ksi] : ' ';
+        /* After the explicit script is consumed, return Enter so the post-setup
+         * menus (difficulty, level-of-competition, ...) select their default item
+         * and the deterministic repro drives all the way to the in-game loop. */
+        char c = ks[ksi] ? ks[ksi] : (getenv("CIV_KEYDEF") ? getenv("CIV_KEYDEF")[0] : '\r');
         if (ks[ksi]) ksi++;
         uint8_t sc = 0x39;                 /* default scancode = space */
         if (c == '\r' || c == '\n') { c = '\r'; sc = 0x1C; }
