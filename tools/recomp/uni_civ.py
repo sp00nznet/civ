@@ -543,6 +543,14 @@ def main():
                   f"bytes={bytes(uc.mem_read(pc, 12)).hex(' ')}")
             print("  opens so far:", st["opens"]); return
         done += SLICE
+        if "--shots" in av and len(st["opens"]) >= 11 and st.get("slice", 0) % 25 == 0:
+            fbb = int(arg(av, "--fb", "0x4a000"), 16)
+            img = bytes(uc.mem_read(fbb, 64000))
+            os.makedirs("work/shots", exist_ok=True)
+            with open(f"work/shots/s{st.get('slice',0):04d}.ppm", "wb") as f:
+                f.write(b"P6\n320 200\n255\n")
+                for b in img:
+                    f.write(bytes([(b * 7) & 0xFF, (b * 3) & 0xFF, (b * 5) & 0xFF]))
         if len(st["opens"]) >= 11:                # at menu: keep the richest A0000
             samp = bytes(uc.mem_read(0xA0000, 64000))
             var = len(set(samp[::97]))

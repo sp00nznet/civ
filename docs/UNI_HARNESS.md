@@ -91,7 +91,27 @@ driver loads at/above A000 (corrupt). Fix: after each `4B03` overlay load, set
 so the graphics + sound drivers pack low and contiguous (`4A1C`/`4A3C`/`4BDD`),
 all below A000. No more divergence.
 
-## Current wall: frame-driven intro pacing
+## Screen visibility: the MCGA offscreen framebuffer
+
+The MCGA driver renders to an **offscreen buffer at ~`0x4A000`** (just below the
+loaded overlays), and never presents it to linear `A0000` (which stays a uniform
+clear — no DAC/CRTC port emulation). Found via a memory-write histogram
+(`--findfb`) then dumping the hot region: it shows the **"Sid Meier's
+CIVILIZATION" title logo** (the buffer holds the two horizontal halves swapped).
+`work/uni_screen.ppm` dumps it (override base with `--fb <hex>`); `--shots` saves
+periodic frames to `work/shots/`. This is the key to navigating headless.
+
+## Current wall: title screen won't advance to the interactive menu
+
+The harness reaches and *renders* the title screen, but it won't transition to the
+New Game menu: the game polls INT 16h AH=0 ~1M times (handled via a keyboard
+buffer feeding scripted keys), yet 'n'/Enter don't advance it, and firing the
+game's INT 8 timer at the title doesn't either. So the title's advance gate is
+something else (a specific input event/scancode, or a state/flag). Now that the
+screen is visible, the next step is to try inputs and watch `work/uni_screen.ppm`
+change — then drive New Game -> setup -> the sp299 load (`--snap-open sp299`).
+
+## (earlier) intro pacing
 
 After credits the MCGA driver runs its per-frame loop: wait on a frame counter
 `es:[0x440]` (`mgraphic 06c7`), compute timing (`0790`, reads `cs:[0x6b3/6b5]`),
