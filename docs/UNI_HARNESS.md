@@ -28,10 +28,23 @@ code run, hooking only the DOS/BIOS services it needs:
 
 ## Where it gets to
 
-Boots **all the way into the game's intro**: loads `misc.exe`, dispatches the
-first INT 3Fh overlay call into the manager at `305a:2d58`, re-opens CIV.EXE,
-opens `intro.txt`, and runs tens of millions of instructions drawing the text
-screen — i.e. the real game is *executing*, not just unpacking.
+Boots into the game and **past the text setup prompts**: loads `misc.exe`,
+dispatches the first INT 3Fh overlay into the manager at `305a:2d58`, draws the
+text **version screen** + **video/sound/input prompts** (visible via the text-mode
+INT 10h below), answers them with tick-paced scripted keys (`1`/`1`/`1`), loads
+the selected **graphics driver `Mgraphic.exe`** (MCGA) + `fonts.cv`, and reaches
+the **"One Moment Please..."** loading screen — then exits 153 because the loaded
+driver overruns VGA memory / can't init graphics in the headless env (next layer).
+
+Two pieces that made the prompts work:
+- **Text-mode INT 10h** (set-mode 03h, AH=02 cursor, AH=0E teletype, AH=09 write
+  char+attr, AH=06 clear) writes `0xB8000`, so the harness can **dump the actual
+  text screen** and see what to type. The game uses BIOS teletype, not direct
+  `0xB8000` writes.
+- **Tick-paced keys**: the game reads keys via **DOS char input** (AH=01/06/07/08),
+  *not* INT 16h, and polls constantly — returning a key every poll floods it
+  (490 k consumed, prompt never settles). Deliver one new key every `KEY_TICKS`
+  BIOS ticks instead. Timer is driven by bumping `0040:006C` once per run-slice.
 
 ## Why it exists (the immediate target)
 

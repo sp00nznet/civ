@@ -85,7 +85,8 @@ def main():
         uc.reg_write(r, v)
 
     st = {"n": 0, "last_cs": None, "trans": 0, "opens": [], "ovl": 0,
-          "mem_free": 0xA000}   # bump alloc ptr; set when program shrinks its block
+          "mem_free": 0xA000,   # bump alloc ptr; set when program shrinks its block
+          "ticks": 0}           # BIOS 18.2 Hz tick (advanced per run-slice)
 
     def hook_code(uc, address, size, _):
         st["n"] += 1
@@ -100,6 +101,15 @@ def main():
             st["stop"] = "instruction cap"; uc.emu_stop()
 
     handles = {}
+    # scripted keys: video=1, sound=1, input=1, then advance (enter/space cycling).
+    # Paced by the BIOS tick (one new key every KEY_TICKS ticks) so the game's
+    # prompt loops settle between keys instead of being flooded every poll.
+    KEYS = [(0x31, 0x02), (0x31, 0x02), (0x31, 0x02)] + [(0x0D, 0x1C), (0x20, 0x39)] * 200
+    KEY_TICKS = 3
+    def next_key(consume):
+        idx = st["ticks"] // KEY_TICKS
+        return KEYS[idx] if idx < len(KEYS) else (0x20, 0x39)
+
     def cf(set_):
         fl = uc.reg_read(R["eflags"])
         uc.reg_write(R["eflags"], (fl | 1) if set_ else (fl & ~1))
@@ -174,6 +184,18 @@ def main():
                 if es == PSP_SEG:                 # program shrinking its own block
                     st["mem_free"] = (es + bx) & 0xFFFF
                 cf(False); return
+            if ah in (0x01, 0x07, 0x08):         # DOS char input (blocking) -> AL=ascii
+                st["kc"] = st.get("kc", 0) + 1
+                uc.reg_write(R["ax"], (ax & 0xFF00) | (next_key(True)[0]))
+                cf(False); return
+            if ah == 0x06:                       # direct console I/O
+                dl = uc.reg_read(R["dx"]) & 0xFF
+                if dl == 0xFF:                   # input poll -> ZF=0 + char
+                    uc.reg_write(R["ax"], (ax & 0xFF00) | next_key(False)[0])
+                    uc.reg_write(R["eflags"], uc.reg_read(R["eflags"]) & ~0x40)  # ZF=0
+                return
+            if ah == 0x0B:                       # check input status -> AL=FF (ready)
+                uc.reg_write(R["ax"], (ax & 0xFF00) | 0xFF); return
             if ah == 0x25:                       # SET interrupt vector (AL=int, DS:DX)
                 al = ax & 0xFF; dx = uc.reg_read(R["dx"]); ds = uc.reg_read(R["ds"])
                 uc.mem_write(al * 4, struct.pack("<HH", dx, ds)); return
@@ -273,39 +295,128 @@ def main():
         if intno == 0x20:
             st["stop"] = "INT 20h"; uc.emu_stop(); return
         if intno == 0x16:                        # BIOS keyboard
-            # scripted keys: video=1, sound=1, input=1, then advance (space/enter)
-            KEYS = [(0x31, 0x02), (0x31, 0x02), (0x31, 0x02)] + \
-                   [(0x20, 0x39), (0x0D, 0x1C)] * 40
-            ki = st.get("ki", 0)
-            key = KEYS[ki] if ki < len(KEYS) else (0x20, 0x39)
+            st["i16"] = st.get("i16", 0) + 1
+            key = next_key(ah in (0x00, 0x10))
             word = (key[1] << 8) | key[0]
-            if ah in (0x00, 0x10):               # read key (blocking) -> consume
-                st["ki"] = ki + 1
+            if ah in (0x00, 0x10):               # read key (blocking)
                 uc.reg_write(R["ax"], word)
             elif ah in (0x01, 0x11):             # status -> key available (ZF=0)
                 uc.reg_write(R["ax"], word)
                 uc.reg_write(R["eflags"], uc.reg_read(R["eflags"]) & ~0x40)
             return
-        # INT 10h/1Ah/33h: stub-succeed (graphics/timer/mouse no-op)
+        if intno == 0x1A and ah == 0x00:         # get system time -> CX:DX ticks
+            t = st["ticks"]
+            uc.reg_write(R["cx"], (t >> 16) & 0xFFFF)
+            uc.reg_write(R["dx"], t & 0xFFFF)
+            uc.reg_write(R["ax"], 0)
+            return
+        if intno == 0x10:                        # minimal text-mode (mode 03) BIOS
+            def getcur():
+                return uc.mem_read(0x450, 1)[0], uc.mem_read(0x451, 1)[0]  # col,row
+            def setcur(col, row):
+                uc.mem_write(0x450, bytes([col & 0xFF, row & 0xFF]))
+            def putcell(col, row, ch, attr=0x07):
+                if 0 <= col < 80 and 0 <= row < 25:
+                    uc.mem_write(0xB8000 + (row * 80 + col) * 2, bytes([ch & 0xFF, attr]))
+            if ah == 0x00:                       # set mode -> clear text screen
+                uc.mem_write(0x449, bytes([ax & 0xFF]))
+                uc.mem_write(0xB8000, b"\x20\x07" * (80 * 25)); setcur(0, 0)
+            elif ah == 0x02:                     # set cursor (DH=row, DL=col)
+                dx = uc.reg_read(R["dx"]); setcur(dx & 0xFF, (dx >> 8) & 0xFF)
+            elif ah == 0x0E:                     # teletype char
+                ch = ax & 0xFF; col, row = getcur()
+                if ch == 0x0D: col = 0
+                elif ch == 0x0A: row += 1
+                elif ch == 0x08: col = max(0, col - 1)
+                else:
+                    putcell(col, row, ch); col += 1
+                if col >= 80: col = 0; row += 1
+                if row >= 25: row = 24
+                setcur(col, row)
+            elif ah == 0x09:                     # write char+attr CX times at cursor
+                ch = ax & 0xFF; bl = uc.reg_read(R["bx"]) & 0xFF
+                cx = uc.reg_read(R["cx"]) or 1; col, row = getcur()
+                for i in range(cx):
+                    putcell(col + i, row, ch, bl)
+            elif ah == 0x06:                     # scroll/clear window -> clear all
+                uc.mem_write(0xB8000, b"\x20\x07" * (80 * 25))
+            return
+        # INT 33h: mouse no-op
         return
+
+    def hook_mem_invalid(uc, access, address, size, value, _):
+        cs = uc.reg_read(R["cs"]); ip = uc.reg_read(R["ip"])
+        kind = {16: "READ_U", 17: "WRITE_U", 18: "FETCH_U",
+                19: "READ_P", 20: "WRITE_P", 21: "FETCH_P"}.get(access, str(access))
+        st.setdefault("badmem", 0)
+        st["badmem"] += 1
+        if st["badmem"] <= 12:
+            print(f"  [MEM-INVALID] {kind} addr={address:#08x} size={size} val={value:#x} "
+                  f"at {cs:04x}:{ip:04x}")
+        # map the offending 64 KB page and continue, to see where it ends up
+        page = address & ~0xFFFF
+        try:
+            uc.mem_map(page, 0x10000)
+        except UcError:
+            pass
+        return True
+
+    def hook_in(uc, port, size, _):
+        # VGA input status (3DA/3BA): toggle bit3 (vsync) + bit0 (display enable)
+        # so retrace-wait loops in the intro/graphics code make progress.
+        if port in (0x3DA, 0x3BA):
+            st["vga"] = st.get("vga", 0) + 1
+            v = 0
+            if st["vga"] & 1: v |= 0x08
+            if st["vga"] & 2: v |= 0x01
+            return v
+        if port == 0x60:                 # keyboard data port
+            return 0x39                  # space scancode
+        return 0xFF
 
     if TRACE:                       # per-instruction hook is the perf bottleneck
         uc.hook_add(UC_HOOK_CODE, hook_code)
     uc.hook_add(UC_HOOK_INTR, hook_intr)
+    uc.hook_add(UC_HOOK_INSN, hook_in, None, 1, 0, UC_X86_INS_IN)
+    uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED
+                | UC_HOOK_MEM_FETCH_UNMAPPED, hook_mem_invalid)
 
     begin = cs0 * 16 + e_ip
     print(f"start {cs0:04x}:{e_ip:04x} (lin {begin:#07x}); running EXEPACK stub...")
-    try:
-        uc.emu_start(begin, TOTAL, count=NMAX)
-    except UcError as e:
-        rg = regs(uc); pc = (rg["cs"] << 4) + rg["ip"]
-        print(f"\nUcError: {e} after {st['n']} insns at {rg['cs']:04x}:{rg['ip']:04x}")
-        print("  bytes@pc:", bytes(uc.mem_read(pc, 16)).hex(" "))
-        print("  opens so far:", st["opens"])
-        return
-    print(f"\nstopped: {st.get('stop')} after {st['n']} insns, {st['trans']} CS transitions, "
-          f"{st['ovl']} INT3F overlay calls")
+    # Run in slices; bump the BIOS 18.2 Hz tick (0040:006C) each slice so the
+    # game's timer-polled loops (intro/menus) advance without a per-insn hook.
+    SLICE = 1_000_000
+    addr, done = begin, 0
+    while done < NMAX and not st.get("stop"):
+        st["ticks"] += 1
+        uc.mem_write(0x46C, struct.pack("<I", st["ticks"]))
+        try:
+            uc.emu_start(addr, TOTAL, count=SLICE)
+        except UcError as e:
+            rg = regs(uc); pc = (rg["cs"] << 4) + rg["ip"]
+            print(f"\nUcError: {e} at {rg['cs']:04x}:{rg['ip']:04x} "
+                  f"bytes={bytes(uc.mem_read(pc, 12)).hex(' ')}")
+            print("  opens so far:", st["opens"]); return
+        done += SLICE
+        rcs = uc.reg_read(R["cs"]); rip = uc.reg_read(R["ip"])
+        addr = (rcs << 4) + rip                                      # resume point
+        sl = st.get("slice", 0); st["slice"] = sl + 1
+        if sl < 40:
+            print(f"  [slice {sl}] resume {rcs:04x}:{rip:04x} opens={len(st['opens'])} ovl={st['ovl']}")
+    print(f"\nstopped: {st.get('stop') or 'instruction cap'} after ~{done} insns, "
+          f"{st['ovl']} INT3F overlay calls, {st['ticks']} ticks")
     print("  file opens:", st["opens"])
+    print(f"  INT16 calls={st.get('i16',0)} keys-consumed={st.get('ki',0)} "
+          f"video-modes={st.get('modes',[])}")
+    # dump the text-mode screen (0xB8000, 80x25, char in even bytes) so we can SEE
+    # which text screen the game is on and feed the right keys.
+    print("  --- text screen (B8000) ---")
+    vid = bytes(uc.mem_read(0xB8000, 80 * 25 * 2))
+    for row in range(25):
+        line = "".join(chr(vid[(row * 80 + c) * 2]) if 32 <= vid[(row * 80 + c) * 2] < 127 else " "
+                        for c in range(80)).rstrip()
+        if line.strip():
+            print(f"  |{line}")
 
 
 if __name__ == "__main__":
