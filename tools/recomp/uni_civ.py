@@ -532,6 +532,11 @@ def main():
                   f"bytes={bytes(uc.mem_read(pc, 12)).hex(' ')}")
             print("  opens so far:", st["opens"]); return
         done += SLICE
+        if len(st["opens"]) >= 11:                # at menu: keep the richest A0000
+            samp = bytes(uc.mem_read(0xA0000, 64000))
+            var = len(set(samp[::97]))
+            if var > st.get("fb_var", 0):
+                st["fb_var"] = var; st["fb_best"] = samp
         rcs = uc.reg_read(R["cs"]); rip = uc.reg_read(R["ip"])
         addr = (rcs << 4) + rip                                      # resume point
         sl = st.get("slice", 0); st["slice"] = sl + 1
@@ -569,17 +574,27 @@ def main():
     # dump the MCGA mode-13h framebuffer (A0000, 320x200x8) so we can SEE graphics
     # screens (menu/map). No DAC palette emulated -> write a grayscale-ish PPM
     # keyed on the index so structure is visible.
-    fb = bytes(uc.mem_read(0xA0000, 320 * 200))
+    fb = st.get("fb_best") or bytes(uc.mem_read(0xA0000, 320 * 200))
     nz = sum(1 for b in fb if b)
-    print(f"  [FB13] A0000 nonzero={nz}/64000")
-    if nz > 200:
-        os.makedirs("work", exist_ok=True)
-        with open("work/uni_fb13.ppm", "wb") as f:
-            f.write(b"P6\n320 200\n255\n")
-            for b in fb:
-                # spread index across RGB so distinct colors are distinguishable
-                f.write(bytes([(b * 7) & 0xFF, (b * 3) & 0xFF, (b * 5) & 0xFF]))
-        print("  wrote work/uni_fb13.ppm")
+    print(f"  [FB13] A0000 nonzero={nz}/64000 best-variety={st.get('fb_var',0)}")
+    # Hunt the offscreen framebuffer: scan paragraph-aligned 64000-byte windows
+    # for one with image-like variety (many distinct bytes, not mostly zero).
+    best = (1, 0xA0000, fb)
+    full = bytes(uc.mem_read(0, min(TOTAL, 0xC0000)))
+    for base in range(0x10000, len(full) - 64000, 0x400):
+        win = full[base:base + 64000]
+        s = win[::149]
+        v = len(set(s))
+        if v > best[0] and s.count(0) < 300:       # varied + not mostly-zero
+            best = (v, base, win)
+    var, base, fbimg = best
+    print(f"  [FBSCAN] richest 64000B window: lin {base:#08x} variety={var}")
+    os.makedirs("work", exist_ok=True)
+    with open("work/uni_fb13.ppm", "wb") as f:
+        f.write(b"P6\n320 200\n255\n")
+        for b in fbimg:
+            f.write(bytes([(b * 7) & 0xFF, (b * 3) & 0xFF, (b * 5) & 0xFF]))
+    print("  wrote work/uni_fb13.ppm")
     # dump the text-mode screen (0xB8000, 80x25, char in even bytes) so we can SEE
     # which text screen the game is on and feed the right keys.
     print("  --- text screen (B8000) ---")
