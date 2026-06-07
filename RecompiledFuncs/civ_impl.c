@@ -253,6 +253,10 @@ void far_205A_2096(CPU *cpu)
                 a, (unsigned long long)call_count);
     }
 
+    /* With a deterministic key script, always report "key available" so the
+     * script getkey (far_0000_09DE) is reached on every poll. */
+    { const char *ks = getenv("CIV_KEYSCRIPT");
+      if (ks && ks[0]) { cpu->ax = 0x00FF; cpu->sp += 4; return; } }
     cpu->ax = keyboard_available(&dos->keyboard) ? 0x00FF : 0x0000;
     if (call_count <= 5 || (call_count % 500) == 0) {
         fprintf(stderr, "[KBHIT] #%llu result=%u\n",
@@ -275,6 +279,26 @@ void far_0000_09DE(CPU *cpu)
 {
     extern void platform_delay(uint32_t ms);
     DosState *dos = get_dos_state(cpu);
+    /* Deterministic key script: CIV_KEYSCRIPT=<chars> returns one char per getkey
+     * call (reproducible New-Game -> sp299 repro, vs the timing-based autokey).
+     * '_' = a 1ms-ish "no real wait" filler returning Space. Returns AL=ascii,
+     * AH=a plausible scancode for the common menu/setup keys. */
+    { const char *ks = getenv("CIV_KEYSCRIPT");
+      if (ks && ks[0]) {
+        static unsigned ksi = 0;
+        char c = ks[ksi] ? ks[ksi] : ' ';
+        if (ks[ksi]) ksi++;
+        uint8_t sc = 0x39;                 /* default scancode = space */
+        if (c == '\r' || c == '\n') { c = '\r'; sc = 0x1C; }
+        else if (c == ' ')          sc = 0x39;
+        else if (c >= '1' && c <= '9') sc = 0x02 + (c - '1');
+        else if (c == 'N' || c == 'n') sc = 0x31;
+        cpu->ax = (uint16_t)((sc << 8) | (uint8_t)c);
+        static int _ks=0; if (++_ks <= 40)
+            fprintf(stderr, "[KEYSCRIPT] #%d getkey -> 0x%04X '%c'\n", _ks, cpu->ax, (c>=32&&c<127)?c:'.');
+        fflush(stderr);
+        cpu->sp += 4; return;
+      } }
     /* Block until a key is available, pumping SDL so the window stays live and
      * a small delay keeps us off 100% CPU. The title menu only calls this after
      * kbhit confirms a key, so in practice it rarely waits. */
@@ -1522,7 +1546,7 @@ void far_205A_30E4(CPU *cpu)
             size_t n = fread(cpu->mem + dest, 1, size, dos->file_table.files[handle]);
             got = (uint16_t)n;
             static int rc = 0; rc++;
-            if (rc <= 20) fprintf(stderr, "[READ] h=%d %u bytes -> %zu\n", handle, size, n);
+            if (rc <= 8) fprintf(stderr, "[READ] h=%d %u bytes -> %zu\n", handle, size, n);
         }
     } else {
         static int fc = 0; fc++;
@@ -4379,29 +4403,14 @@ static void pic_refill_buffer(CPU *cpu)
     push16(cpu, cpu->dx);
     uint16_t cb_off = mem_read16(cpu, cpu->ds, 0xE84A);
     uint16_t cb_seg = mem_read16(cpu, cpu->ds, 0xE84C);
-    /* The refill callback is far_1FB6_0642 (== res_020191), set up by res_02013E
-     * with the relocated segment 0x20B6 (== 0x1FB6+LOAD_SEG) for sp299.pic, or
-     * the unrelocated 0x1FB6 for the title/intro PICs.
-     * NOTE: dispatching the 0x20B6 form for sp299.pic currently spins: the refill
-     * reads DS:0x686C (the token 0xF200) but far_205A_30E4 resolves handle 0
-     * because sp299's file slot is freed while the decoder keeps requesting
-     * refills (sp299 decode does not terminate — a sprite-sheet format issue,
-     * task #4). Until that's fixed, only dispatch the title/intro (0x1FB6) form;
-     * sp299's 0x20B6 falls through to the warning and the game idles at the
-     * post-sp299 screen instead of hanging. */
     /* The refill callback is far_1FB6_0642 (== res_020191): read 512B of the .pic
      * via far_205A_30E4 using the file token at DS:0x686C. The title/intro PICs
-     * set the callback seg to the unrelocated 0x1FB6; sp299.pic uses the relocated
-     * 0x20B6 (== 0x1FB6+LOAD_SEG). Dispatching the 0x20B6 form is CORRECT and reads
-     * real sp299 data for ~6 refills (3KB, [READ] h=5), BUT then far_205A_30E4
-     * resolves the 0xF200 token to h=0: the file slot is freed mid/post-decode
-     * while the decoder keeps requesting refills -> [READ] h=0 spin. Root: the
-     * sp299 sprite-sheet decode in far_0000_1080/far_0000_11FA doesn't terminate
-     * (its output-size target is wrong for a multi-sprite sheet vs a single LZW
-     * image), so it over-reads past the closed file. Fixing that (the decode
-     * loop's termination + file lifetime) is the task; until then dispatch only
-     * the 0x1FB6 form so sp299 idles instead of hanging. */
-    if (cb_off == 0x0642 && cb_seg == 0x1FB6) {
+     * set the callback seg to the unrelocated 0x1FB6; sp299.pic (and the other
+     * in-game sprite sheets) use the relocated 0x20B6 (== 0x1FB6+LOAD_SEG). Both
+     * forms are dispatched. The sprite-sheet decode used to corrupt DS:0x686C
+     * (a self-referential LZW dict chain overran the decode stack) — fixed in
+     * res_0012F6 (KwKwK walks prev_code, not dx; prev_code save uses cx). */
+    if (cb_off == 0x0642 && (cb_seg == 0x1FB6 || cb_seg == 0x20B6)) {
         push16(cpu, cpu->cs); push16(cpu, 0);
         res_020191(cpu);
     } else {
@@ -4532,20 +4541,37 @@ void res_0012F6(CPU *cpu)
     uint16_t code = pic_read_code(cpu);
     uint16_t cx = code;
 
-    /* Handle code >= next free entry (KwKwK case) */
+    /* Walk starts from the code itself for a normal (already-defined) code. */
+    uint16_t walk_code = code;
+
+    /* Handle code >= next free entry (KwKwK case).
+     * Output = prev_string + first_char(prev_string). The original
+     * (0x135F-0x1369) sets cx=dx, pushes the OLD first char [0x688C] as the
+     * trailing "K", then walks from the PREVIOUS code [0x688A] — NOT dx (which
+     * is the not-yet-defined entry; walking it reads a stale/self-referential
+     * dict slot -> infinite chain -> decode-stack overrun). */
     if ((int16_t)code >= (int16_t)dx) {
         cx = dx;
-        /* Push the first char of previous string */
-        uint16_t prev_first = mem_read16(cpu, cpu->ds, 0x688A);
         uint8_t prev_first_char = mem_read8(cpu, cpu->ds, 0x688C);
-        /* Use the first char of the previous code's output */
         decode_sp -= 2;
         mem_write8(cpu, cpu->ds, decode_sp, prev_first_char);
+        walk_code = mem_read16(cpu, cpu->ds, 0x688A);  /* prev_code */
     }
 
-    /* Walk the dictionary chain, pushing characters onto decode stack */
-    uint16_t walk_code = cx;
+    /* Walk the dictionary chain, pushing characters onto decode stack.
+     * A valid LZW chain strictly descends (parent < child) and ends at a
+     * root (parent==0xFFFF); the guard below is a defensive backstop against a
+     * corrupt/circular chain so it can never overrun the state region. */
+    int _walk_n = 0;
     while (1) {
+        if (decode_sp <= 0x6890 || ++_walk_n > 4096) {
+            static int _ov=0; if (++_ov <= 8)
+                fprintf(stderr, "[LZWOVR] decode_sp=%04X walk_code=%04X parent=%04X code=%04X dx=%04X n=%d\n",
+                        decode_sp, walk_code,
+                        mem_read16(cpu, cpu->ds, (uint16_t)(walk_code*3+dict_base_parent)),
+                        code, dx, _walk_n);
+            break;
+        }
         uint16_t parent = mem_read16(cpu, cpu->ds, (uint16_t)(walk_code * 3 + dict_base_parent));
         uint8_t ch = mem_read8(cpu, cpu->ds, (uint16_t)(walk_code * 3 + dict_base_char));
         if ((int16_t)(parent + 1) == 0) {
@@ -4577,9 +4603,9 @@ void res_0012F6(CPU *cpu)
         cur_bits++;
         uint8_t max_bits = mem_read8(cpu, cpu->ds, 0x6881);
         if ((int8_t)cur_bits > (int8_t)max_bits) {
-            /* Dictionary full - reset */
+            /* Dictionary full - reset (original calls res_00124E at 0x13B0,
+             * then writes [0x688A]=cx afterwards — done once below). */
             mem_write16(cpu, cpu->ds, 0x6884, dx);
-            mem_write16(cpu, cpu->ds, 0x688A, code);
             push16(cpu, 0);
             res_00124E(cpu);
             dx = mem_read16(cpu, cpu->ds, 0x6884);
@@ -4593,7 +4619,10 @@ void res_0012F6(CPU *cpu)
     }
 
     mem_write16(cpu, cpu->ds, 0x6884, dx);
-    mem_write16(cpu, cpu->ds, 0x688A, code);
+    /* Original (0x13B3) saves CX, which is `code` for a normal code but `dx`
+     * for the KwKwK case — saving `code` there seeds a wrong prev_code and
+     * creates self/forward-referential dict entries. */
+    mem_write16(cpu, cpu->ds, 0x688A, cx);
 
     /* Pop first byte from decode stack */
     cpu->al = mem_read8(cpu, cpu->ds, decode_sp);

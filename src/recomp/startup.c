@@ -301,33 +301,35 @@ void res_02A310(CPU *cpu)
         printf("[STARTUP] DS:0x1A93 string: '%s'\n", buf);
     }
 
-    /* Scan decompressed memory for CD 3F (INT 3F overlay calls) in the code */
+    /* Scan decompressed memory for CD 3F (INT 3F overlay calls) in the code.
+     * The per-call dump is verbose; gate it behind CIV_DUMPTHUNKS=1. */
+    int _dump_thunks = (getenv("CIV_DUMPTHUNKS") != NULL);
     {
         uint32_t base = 0x0100 * 16;  /* LOAD_SEG * 16 */
         uint32_t end = base + 0x30C8 * 16;
-        printf("[THUNKS] Scanning for CD 3F (INT 3F) in resident code:\n");
+        if (_dump_thunks) printf("[THUNKS] Scanning for CD 3F (INT 3F) in resident code:\n");
         int count = 0;
         for (uint32_t addr = base; addr + 3 <= end && addr + 3 <= MEM_SIZE; addr++) {
             uint8_t *b = &cpu->mem[addr];
             if (b[0] == 0xCD && b[1] == 0x3F) {
                 uint16_t off = (uint16_t)(addr - base);
-                printf("[INT3F] off=0x%04X ovl=%02d flat=0x%06X ctx=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                if (_dump_thunks) printf("[INT3F] off=0x%04X ovl=%02d flat=0x%06X ctx=%02X %02X %02X %02X %02X %02X %02X %02X\n",
                        off, b[2], addr, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
                 count++;
             }
         }
-        printf("[THUNKS] Found %d INT 3F calls\n", count);
+        if (_dump_thunks) printf("[THUNKS] Found %d INT 3F calls\n", count);
 
         /* Also dump the overlay manager data area.
          * In MSC 5.x, the overlay manager stores its dispatch table
          * near the INT 3F handler. The INT 3F vector is at IVT 0x3F*4 = 0xFC */
         uint16_t int3f_off = cpu->mem[0xFC] | (cpu->mem[0xFD] << 8);
         uint16_t int3f_seg = cpu->mem[0xFE] | (cpu->mem[0xFF] << 8);
-        printf("[INT3F] Vector: %04X:%04X\n", int3f_seg, int3f_off);
+        if (_dump_thunks) printf("[INT3F] Vector: %04X:%04X\n", int3f_seg, int3f_off);
 
         /* Dump thunk table entries at image offset 0x0761 */
-        printf("[THUNKS] Dumping thunk table (7-byte entries at off 0x0761):\n");
-        for (int i = 0; i < 40; i++) {
+        if (_dump_thunks) printf("[THUNKS] Dumping thunk table (7-byte entries at off 0x0761):\n");
+        for (int i = 0; _dump_thunks && i < 40; i++) {
             uint32_t taddr = base + 0x0761 + i * 7;
             uint8_t *t = &cpu->mem[taddr];
             if (t[0] == 0xCD && t[1] == 0x3F) {

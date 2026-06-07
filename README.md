@@ -5,6 +5,13 @@
 > *"I've played a lot of Civilization in my time, I can tell you."*
 > — Literally everyone who has ever touched this game
 
+![Civilization title screen running natively via static recompilation](docs/screenshots/title.png)
+
+*The recompiled title screen running natively on Windows 11 — the full intro
+(logo → birth → credits in color) plays, then the menu builds from `king.txt`,
+and New Game drives world generation, the sprite-sheet decode, and the
+civilization-select screen.*
+
 ---
 
 ## What Is This?
@@ -525,15 +532,31 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
       **intro → menu → New Game → world-gen → game loop**
 - [ ] Map tile rendering — the in-game map is a solid fill; `far_0000_083F` (tile/
       sprite blitter, ~64 callers) is still a stub
-- [ ] **sp299.pic sprite-sheet decode** — its LZW refill reads a stale handle
-      (`DS:0x686C`→0); the loader skips the decode-context setup (`res_02013E`).
-      A new **Unicorn-engine harness** (modeled on the bolo recomp's `uni_*` tools)
-      will snapshot the original's memory at the sp299 load to recover the correct
-      setup
-- [ ] Interactive, screen-aware input to walk civ-select → the real game loop
-      (`res_0023F0`)
+- [x] **A Unicorn-engine harness** (`tools/recomp/uni_civ.py`, modeled on the bolo
+      recomp's `uni_*` tools) boots the *original* CIV.EXE headless — through EXEPACK,
+      the MSC crt0, the DOS memory manager, the INT 3Fh overlay manager and graphics-
+      driver loads — all the way to the rendered title screen, for ground-truth
+      observation (see `docs/UNI_HARNESS.md`)
 
-### Phase 17 — Gameplay
+### Phase 17 — Sprite-Sheet Decode & Civilization Select
+
+- [x] **sp299.pic sprite-sheet LZW decode fixed.** The post-New-Game sprite sheet
+      corrupted `DS:0x686C` (the refill file token) → a `read handle 0` spin. Two bugs
+      in the core LZW byte decoder (`res_0012F6`), found by disassembling the original
+      (`@dump 0x12F6`, capstone): the **KwKwK** case walked the *not-yet-defined* dict
+      entry (`dx`) instead of the previous code (`[0x688A]`) → a self-referential
+      dictionary chain whose unbounded walk overran the decode stack (base `0x6A8D`,
+      grows down) into the state region and `0x686C`; and the `prev_code` save wrote
+      `code` instead of `cx`. Both fixed → the decode terminates cleanly
+- [x] **Civilization / difficulty-select screen reached.** With the decode fixed, the
+      game grabs the 41×58 leader-portrait sprites from the sheet, loads `arch.pic`
+      (throne room) + `back0a.pal`/`sp256.pal`, and builds the `*ARCH` select screen
+- [x] **Deterministic New-Game repro** via `CIV_KEYSCRIPT=<chars>` (scripted getkey/
+      kbhit) — `CIV_KEYSCRIPT=N` reliably drives New Game → world-gen → sprite decode
+- [ ] Drive the civ-select screen → the real in-game loop (`res_0023F0`)
+- [ ] Map tile rendering (`far_0000_083F`)
+
+### Phase 17.5 — Gameplay
 
 - [x] Title screen + main menu (New Game / Load / Earth / Custom)
 - [ ] Map tile rendering
