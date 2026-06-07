@@ -322,6 +322,8 @@ def main():
                     # so subsequent driver overlays load right after it, below A000.
                     ominalloc = struct.unpack_from("<H", ov, 0x0A)[0]
                     end = load_seg + (oimg + 15) // 16 + ominalloc
+                    if "graphic" in base.lower():
+                        st["gfx_seg"] = load_seg          # for frame-counter pacing
                     if load_seg < MEM_TOP and end <= MEM_TOP:
                         st["mem_free"] = min(st["mem_free"], end)
                     st.setdefault("ovls", []).append(base)
@@ -444,10 +446,24 @@ def main():
         # VGA input status (3DA/3BA): toggle bit3 (vsync) + bit0 (display enable)
         # so retrace-wait loops in the intro/graphics code make progress.
         if port in (0x3DA, 0x3BA):
-            st["vga"] = st.get("vga", 0) + 1
+            # Realistic VGA status: vsync (bit3) high briefly, then a long display
+            # window (bit3=0). The MCGA driver CALIBRATES by counting 0x3DA reads
+            # during the display period (mgraphic 07a4) and divides by it; a too-
+            # fast toggle gives count~1 -> div garbage -> the frame loop wedges.
+            c = st.get("vga", 0); st["vga"] = c + 1
+            # The driver calibrates by counting reads during the display window
+            # with two different inner-delays (BX=1 then BX=0x11) and divides by
+            # the DIFFERENCE. On hardware the window is fixed *time*, so a slower
+            # inner-loop yields fewer counts. Our window is fixed *reads*, giving
+            # equal counts -> bx=0 -> div-by-zero -> INT0 retry loop. Make the
+            # period depend on BX (the live inner-delay) so the counts differ.
+            bxr = uc.reg_read(R["bx"]) & 0xFF
+            period = 800 - bxr * 12           # smaller delay -> longer -> more counts
+            if period < 200: period = 200
+            phase = c % period
             v = 0
-            if st["vga"] & 1: v |= 0x08
-            if st["vga"] & 2: v |= 0x01
+            if phase < period * 0.13: v |= 0x08   # vertical retrace
+            if phase < period * 0.16: v |= 0x01   # display-disable
             return v
         if port == 0x60:                 # keyboard data port
             return 0x39                  # space scancode
@@ -473,6 +489,12 @@ def main():
     while done < NMAX and not st.get("stop"):
         st["ticks"] += 1
         uc.mem_write(0x46C, struct.pack("<I", st["ticks"]))
+        # Pace the frame counter es:[0x440] every slice while executing in the
+        # graphics driver (its per-frame loop waits on it; no timer ISR fires it
+        # headless). This drives the frame-driven intro/credits forward.
+        if uc.reg_read(R["cs"]) == st.get("gfx_seg") and st.get("record"):
+            es = uc.reg_read(R["es"]); a = (es << 4) + 0x440
+            uc.mem_write(a, bytes([(uc.mem_read(a, 1)[0] + 1) & 0xFF]))
         # NOTE: the game hooks INT 8 (PIT) and its graphics driver waits on a
         # frame counter that handler increments (spin at mgraphic 9100:06c7,
         # `cmp [0x440],al; je`). Firing INT 8 every slice here advances the
