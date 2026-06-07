@@ -158,7 +158,9 @@ def main():
     # scripted keys: video=1, sound=1, input=1, then advance (enter/space cycling).
     # Paced by the BIOS tick (one new key every KEY_TICKS ticks) so the game's
     # prompt loops settle between keys instead of being flooded every poll.
-    KEYS = [(0x31, 0x02), (0x31, 0x02), (0x31, 0x02)] + [(0x0D, 0x1C), (0x20, 0x39)] * 200
+    # video=1, sound=1, input=2 (KEYBOARD ONLY -- so the menu is keyboard-driven,
+    # not mouse; we don't emulate INT 33h mouse), then advance keys.
+    KEYS = [(0x31, 0x02), (0x31, 0x02), (0x32, 0x03)] + [(0x0D, 0x1C), (0x20, 0x39)] * 200
     KEY_TICKS = 3
     def next_key(consume):
         idx = st["ticks"] // KEY_TICKS
@@ -384,6 +386,12 @@ def main():
         if intno == 0x16:                        # BIOS keyboard (buffer-based)
             st["i16"] = st.get("i16", 0) + 1
             _d = st.setdefault("i16ah", {}); _d[ah] = _d.get(ah, 0) + 1
+            if st.get("record"):                 # at title: log the FAR-RETURN site
+                sp = uc.reg_read(R["sp"]); ss = uc.reg_read(R["ss"])
+                rip = struct.unpack("<H", uc.mem_read((ss << 4) + sp, 2))[0]
+                rcs = struct.unpack("<H", uc.mem_read((ss << 4) + sp + 2, 2))[0]
+                site = (rcs, rip)
+                cs2 = st.setdefault("i16site", {}); cs2[site] = cs2.get(site, 0) + 1
             kbuf = st.setdefault("kbuf", [])
             if ah in (0x01, 0x11):               # status: ZF=0 + key if buffered
                 if kbuf:
@@ -523,12 +531,18 @@ def main():
         # At the title/menu (king.txt loaded) the game polls INT 16h for keys.
         # Feed one scripted key per slice via the BIOS-keyboard buffer (kbuf) so
         # the menu isn't flooded: 'n' (New Game) then Enter to take setup defaults.
-        if len(st["opens"]) >= 11 and st.get("slice", 0) % 3 == 0:
+        if len(st["opens"]) >= 11:
             kbuf = st.setdefault("kbuf", [])
             if not kbuf:
-                MENU = [(0x31 << 8) | 0x6E] + [(0x1C << 8) | 0x0D] * 16  # n, Enter...
+                # cycle likely title/menu keys, watch which advances (--stop-open)
+                MENU = [(0x1F << 8) | 0x73,   # s (Start)
+                        (0x31 << 8) | 0x6E,   # n (New)
+                        (0x1C << 8) | 0x0D,   # Enter
+                        (0x39 << 8) | 0x20,   # Space
+                        (0x50 << 8) | 0x00,   # Down arrow
+                        (0x02 << 8) | 0x31]   # 1
                 ki = st.get("ki9", 0); st["ki9"] = ki + 1
-                kbuf.append(MENU[ki] if ki < len(MENU) else (0x1C << 8) | 0x0D)
+                kbuf.append(MENU[ki % len(MENU)])
         # NOTE: the game hooks INT 8 (PIT) and its graphics driver waits on a
         # frame counter that handler increments (spin at mgraphic 9100:06c7,
         # `cmp [0x440],al; je`). Firing INT 8 every slice here advances the
@@ -590,6 +604,11 @@ def main():
     print("  file opens:", st["opens"])
     print(f"  INT16 calls={st.get('i16',0)} AH-breakdown={st.get('i16ah',{})} "
           f"keys-pushed={st.get('ki9',0)}")
+    if st.get("i16site"):
+        top = sorted(st["i16site"].items(), key=lambda kv: -kv[1])[:5]
+        print("  [I16SITE] INT16 callers (cs:ip after the CD16 : count):")
+        for (cs, ip), n in top:
+            print(f"    {cs:04x}:{ip:04x} : {n}")
     if st.get("wpg"):
         top = sorted(st["wpg"].items(), key=lambda kv: -kv[1])[:12]
         print("  [FINDFB] hottest write 4KB-pages (lin base : count):")
