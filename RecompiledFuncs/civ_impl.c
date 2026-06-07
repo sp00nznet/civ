@@ -192,8 +192,13 @@ void far_205A_20AA(CPU *cpu)
     if (pending_scan) {
         cpu->ax = (uint16_t)pending_scan;
         pending_scan = 0;
+        cpu->sp += 4; /* far ret (was missing -> stack corruption) */
         return;
     }
+    /* Deterministic key script: feed Enter to advance dialogs/prompts (e.g. the
+     * civ-select screen waits on getch). Lets CIV_KEYSCRIPT drive past it. */
+    { const char *ks = getenv("CIV_KEYSCRIPT");
+      if (ks && ks[0]) { cpu->ax = 0x0D; cpu->sp += 4; return; } }
     DosState *dos = get_dos_state(cpu);
     fprintf(stderr, "[BLOCK] Waiting for key in far_205A_20AA (getch)\n");
     while (!keyboard_available(&dos->keyboard)) {

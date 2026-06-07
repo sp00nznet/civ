@@ -54,7 +54,11 @@ extern void ovl12_03D15C(CPU *cpu);  /* entry 91 */
  * screen-grab primitive: far_076F(flag, x, y, w, h) captures a w*h rect and
  * returns a sprite handle later blitted by far_0000_083F. Hand-implemented in
  * civ_impl.c. See session log 2026-05-30. */
-void far_0000_0776(CPU *cpu) { ovl02_02D72A(cpu); }
+/* far_0000_0776 was MIS-ALIASED to ovl02_02D72A (a full-screen builder that
+ * fills 320x200 + loads a PIC) — wrong for a 7-arg per-civ stat/value renderer;
+ * it spun the civ-select leader loop (ovl05_030C49) on civ 5's data. Stub as a
+ * no-op far ret (cosmetic stat draw) to unblock; caller cleans the 7 args. */
+void far_0000_0776(CPU *cpu) { cpu->sp += 4; }
 void far_0000_07B5(CPU *cpu) { ovl03_02E45D(cpu); }
 /* far_0000_07E6 is the PIC row blitter (src linear buffer -> dst page row),
  * NOT ovl05_02FFC2 (which mis-used arg1 as a page index). Implemented in
