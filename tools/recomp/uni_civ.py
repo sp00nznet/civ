@@ -39,6 +39,8 @@ TOTAL = 0x110000                 # 1 MB + 64 KB (covers seg:off wraparound)
 # after COMMAND.COM) so CS > the ~0x3200-paragraph decompressed size.
 LOAD_SEG = 0x1000
 PSP_SEG = LOAD_SEG - 0x10
+# Top of conventional memory (real DOS: VGA starts at A000 = 640 KB).
+MEM_TOP = 0xA000
 
 R = {n: getattr(sys.modules["unicorn.x86_const"], "UC_X86_REG_" + n.upper())
      for n in ("ax bx cx dx si di bp sp cs ds es ss ip eflags".split())}
@@ -74,9 +76,10 @@ def main():
     uc.mem_write(LOAD_SEG * 16, module)
     # minimal PSP (top-of-memory segment at +2)
     uc.mem_write(PSP_SEG * 16, b"\xCD\x20")
-    uc.mem_write(PSP_SEG * 16 + 2, struct.pack("<H", 0xA000))
-    # BIOS data area: conventional memory size = 640 KB (word at 0040:0013, KB)
-    uc.mem_write(0x40 * 16 + 0x13, struct.pack("<H", 640))
+    uc.mem_write(PSP_SEG * 16 + 2, struct.pack("<H", MEM_TOP))
+    # BIOS data area: conventional memory size (word at 0040:0013, in KB),
+    # consistent with MEM_TOP so the overlay manager's cross-check doesn't fire.
+    uc.mem_write(0x40 * 16 + 0x13, struct.pack("<H", MEM_TOP * 16 // 1024))
 
     cs0 = (LOAD_SEG + e_cs) & 0xFFFF
     ss0 = (LOAD_SEG + e_ss) & 0xFFFF
@@ -85,7 +88,7 @@ def main():
         uc.reg_write(r, v)
 
     st = {"n": 0, "last_cs": None, "trans": 0, "opens": [], "ovl": 0,
-          "mem_free": 0xA000,   # bump alloc ptr; set when program shrinks its block
+          "mem_free": MEM_TOP,   # bump alloc ptr; set when program shrinks its block
           "ticks": 0}           # BIOS 18.2 Hz tick (advanced per run-slice)
 
     def hook_code(uc, address, size, _):
@@ -168,7 +171,7 @@ def main():
                 uc.reg_write(R["ax"], 0x0005); return
             if ah == 0x48:                       # ALLOC paragraphs (BX)
                 bx = uc.reg_read(R["bx"])
-                avail = 0xA000 - st["mem_free"]
+                avail = MEM_TOP - st["mem_free"]
                 if bx <= avail:
                     seg = st["mem_free"]; st["mem_free"] += bx
                     print(f"  [INT21/48] alloc {bx:#x} para -> seg {seg:04X} (free now {st['mem_free']:04X})")
