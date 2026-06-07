@@ -41,6 +41,13 @@ LOAD_SEG = 0x1000
 PSP_SEG = LOAD_SEG - 0x10
 # Top of conventional memory (real DOS: VGA starts at A000 = 640 KB).
 MEM_TOP = 0xA000
+# The game sizes its heap as (largest-free - 0x100), then loads the graphics
+# driver overlay into the tiny region left at the top; its overrun check rejects
+# the load if the driver's relocated internal top segment exceeds A000. Report a
+# slightly lower allocation ceiling so the heap leaves ~0x300 paras (12 KB) of
+# headroom -> the driver loads low enough that even the largest (egraphic ~0x2b5)
+# fits. Real-mode VGA RAM above this is unused headless.
+ALLOC_CEIL = MEM_TOP - 0x300
 
 R = {n: getattr(sys.modules["unicorn.x86_const"], "UC_X86_REG_" + n.upper())
      for n in ("ax bx cx dx si di bp sp cs ds es ss ip eflags".split())}
@@ -90,6 +97,22 @@ def main():
     st = {"n": 0, "last_cs": None, "trans": 0, "opens": [], "ovl": 0,
           "mem_free": MEM_TOP,   # bump alloc ptr; set when program shrinks its block
           "ticks": 0}           # BIOS 18.2 Hz tick (advanced per run-slice)
+
+    import capstone
+    _md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_16)
+
+    def hook_trace(uc, address, size, _):
+        if st.get("trace_n", 0) <= 0:
+            return
+        code = bytes(uc.mem_read(address, min(size, 15)))
+        cs = uc.reg_read(R["cs"]); ip = uc.reg_read(R["ip"])
+        ins = next(_md.disasm(code, ip), None)
+        txt = f"{ins.mnemonic} {ins.op_str}" if ins else code.hex(" ")
+        print(f"    {cs:04x}:{ip:04x}  ax={uc.reg_read(R['ax']):04x} bx={uc.reg_read(R['bx']):04x} "
+              f"| {txt}")
+        st["trace_n"] -= 1
+        if st["trace_n"] == 0:
+            st["stop"] = "trace done"; uc.emu_stop()
 
     def hook_code(uc, address, size, _):
         st["n"] += 1
@@ -171,7 +194,13 @@ def main():
                 uc.reg_write(R["ax"], 0x0005); return
             if ah == 0x48:                       # ALLOC paragraphs (BX)
                 bx = uc.reg_read(R["bx"])
-                avail = MEM_TOP - st["mem_free"]
+                # Floor the reported largest-free block: the game loads the
+                # graphics-driver overlay into (avail - 0x100) and its overrun
+                # check compares the driver size against that. When real free
+                # space is tiny (heap took it all), report >= 0x1000 so the
+                # driver gets a real block and fits (headless: VGA RAM above A000
+                # is unused, and TOTAL covers the writes).
+                avail = max(0x1000, ALLOC_CEIL - st["mem_free"])
                 if bx <= avail:
                     seg = st["mem_free"]; st["mem_free"] += bx
                     print(f"  [INT21/48] alloc {bx:#x} para -> seg {seg:04X} (free now {st['mem_free']:04X})")
@@ -180,6 +209,9 @@ def main():
                     print(f"  [INT21/48] alloc {bx:#x} FAIL, avail={avail:#x} para")
                     uc.reg_write(R["ax"], 0x08)          # insufficient memory
                     uc.reg_write(R["bx"], avail); cf(True)  # largest available
+                    if "--tracealloc" in av and not st.get("traced") and avail < 0x800:
+                        st["traced"] = 1; st["trace_n"] = 700
+                        print("  --- tracing driver-load alloc + overrun check ---")
                 return
             if ah == 0x4A:                       # RESIZE block (ES, BX paragraphs)
                 es = uc.reg_read(R["es"]); bx = uc.reg_read(R["bx"])
@@ -379,6 +411,8 @@ def main():
 
     if TRACE:                       # per-instruction hook is the perf bottleneck
         uc.hook_add(UC_HOOK_CODE, hook_code)
+    if "--tracealloc" in av:
+        uc.hook_add(UC_HOOK_CODE, hook_trace)
     uc.hook_add(UC_HOOK_INTR, hook_intr)
     uc.hook_add(UC_HOOK_INSN, hook_in, None, 1, 0, UC_X86_INS_IN)
     uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED
@@ -406,6 +440,20 @@ def main():
         sl = st.get("slice", 0); st["slice"] = sl + 1
         if sl < 40:
             print(f"  [slice {sl}] resume {rcs:04x}:{rip:04x} opens={len(st['opens'])} ovl={st['ovl']}")
+        # if the resume point is stuck (same for several slices), disassemble it
+        if addr == st.get("last_resume"):
+            st["stuck"] = st.get("stuck", 0) + 1
+            if st["stuck"] == 6 and "--spin" in av:
+                import capstone as _c
+                md = _c.Cs(_c.CS_ARCH_X86, _c.CS_MODE_16)
+                code = bytes(uc.mem_read(addr & ~0xF, 0x60))
+                print(f"  --- spin loop @ {rcs:04x}:{rip:04x} (lin {addr:#07x}) ---")
+                for ins in md.disasm(code, (addr & ~0xF) - (rcs << 4)):
+                    print(f"    {ins.address:04x}: {ins.mnemonic} {ins.op_str}")
+                st["stop"] = "spin dumped"; uc.emu_stop()
+        else:
+            st["stuck"] = 0
+        st["last_resume"] = addr
     print(f"\nstopped: {st.get('stop') or 'instruction cap'} after ~{done} insns, "
           f"{st['ovl']} INT3F overlay calls, {st['ticks']} ticks")
     print("  file opens:", st["opens"])

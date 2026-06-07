@@ -54,19 +54,31 @@ to 0; the loader seems to skip `res_02013E`). `--snap-open sp299` dumps the full
 image + the decode-context globals (`0x686C`, `0xE84A/4C`, `0xC19E`, `0x54D8`)
 the moment sp299.pic is opened, so we can diff against the recomp.
 
-## Current wall: graphics-driver overlay overrun (exit 153)
+## SOLVED: graphics-driver overrun -> boots into the real intro
 
-After the prompts, the game allocates its main heap as `DOS_alloc(0xFFFF)` →
-`avail`, then `alloc(avail - 0x100)`, leaving a small region at the top; it then
-loads the selected graphics driver (`Mgraphic.exe`, ~6.6 KB) there via `4B03` and
-its overlay manager prints **"Overlay has overrun allocated memory"** + exits 153.
-The reserved top region works out to only ~4 KB in this harness, too small for the
-driver — but raising `MEM_TOP`, lowering `LOAD_SEG`, or shrinking the reported
-`avail` doesn't move the check (the game always reserves a fixed amount of *its*
-reported avail). So the real fix is to match the original's memory layout exactly:
-disassemble the MSC overlay manager's alloc/size/overrun code (the
-"Overlay has overrun" string is at dump offset `0x2f629`; the check is nearby) and
-reproduce its arithmetic. Until then the harness stops at "One Moment Please...".
+The exit-153 "Overlay has overrun allocated memory" was the overlay manager's
+check `cmp bx, [0x53bc]` where `[0x53bc]` is the last `DOS_alloc` query's
+`(avail - 0x100)`. The driver-load free-query returned `avail = 0x100` (the heap
+took everything else), so `[0x53bc]` got set to **0** and any driver size
+overran. Fix: **floor the reported largest-free block at `0x1000`** so the
+driver-load query yields a real block (`avail - 0x100` >= driver size); headless,
+the VGA RAM above A000 is unused and `TOTAL` covers the writes. (Found by
+single-step-tracing the alloc path — `--tracealloc`.)
+
+With that, the harness loads the graphics driver (`Mgraphic.exe`), `fonts.cv`, the
+sound driver (`Nsound.cvl`), then `logo.pic` / `birth0,1.pic` / `credits.txt` —
+**the exact intro assets the recomp loads** — i.e. it now runs the real game's
+intro headless.
+
+## Current wall: divergence after the credits
+
+After `credits.txt` the game makes a bad control transfer and ends up executing
+zero-filled memory at `ffcc:0340` (lin `0x100000`) — a headless-fidelity issue:
+with INT 10h graphics / timer / sound only stubbed, some pointer goes wild. Use
+`--spin` to dump the stuck loop. Reaching the title menu (`king.txt`) and the
+sp299 load needs more faithful INT 10h (a real mode-13h framebuffer + the bits
+the intro reads back) and likely a real timer ISR (INT 8). `--tracealloc` /
+`--spin` are the diagnostics for chasing these.
 
 ## TODO / next
 
