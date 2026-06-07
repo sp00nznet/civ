@@ -59,7 +59,14 @@ extern void ovl12_03D15C(CPU *cpu);  /* entry 91 */
  * it spun the civ-select leader loop (ovl05_030C49) on civ 5's data. Stub as a
  * no-op far ret (cosmetic stat draw) to unblock; caller cleans the 7 args. */
 void far_0000_0776(CPU *cpu) { cpu->sp += 4; }
-void far_0000_07B5(CPU *cpu) { ovl03_02E45D(cpu); }
+/* far_0000_07B5 was MIS-ALIASED to ovl03_02E45D (a full-screen white-fill) by
+ * resolve_stubs.py's proximity heuristic — but it's the menu's "text line-height"
+ * query: res_01D221 stores its return in [0x2F54] (the item height, divided by in
+ * the click handler) and special-cases 9. The bad alias painted every menu screen
+ * full white. The menu uses the built-in 8x8 font (far_0000_077D char-width=8), so
+ * return 9 (the code subtracts 1 -> 8px line spacing). Takes 1 arg (font/style),
+ * caller cleans it; far ret. */
+void far_0000_07B5(CPU *cpu) { cpu->ax = 9; cpu->sp += 4; }
 /* far_0000_07E6 is the PIC row blitter (src linear buffer -> dst page row),
  * NOT ovl05_02FFC2 (which mis-used arg1 as a page index). Implemented in
  * civ_impl.c. See session 2026-06-01 §10. */
