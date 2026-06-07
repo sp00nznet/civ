@@ -16,6 +16,7 @@
 #include "platform/font8x8.h"  /* CP437 8x8 font for far_0000_07F4 text rendering */
 
 #include <stdio.h>
+#include <stdlib.h>  /* getenv - without this, the implicit int decl truncates the 64-bit pointer */
 #include <string.h>
 #include <time.h>
 
@@ -59,6 +60,39 @@ static uint16_t civ_file_slot_to_token(int slot) {
     return (uint16_t)(CIV_FILE_TOKEN_BASE | (slot * 8));
 }
 
+/* Most-recently-loaded PIC palette (6-bit RGB), applied by far_0000_07E6.
+ * Captured directly from the .pic file's 'M0' chunk at open time, because the
+ * game's transient header buffer at DS:0xC936 is overwritten by the LZW
+ * dictionary during decode (so it can't be read at row-blit time). */
+uint8_t g_pic_pal[768];
+int     g_pic_pal_valid = 0;
+
+/* Parse the 'M0' (0x304D) palette chunk out of an LBM-style Civ .pic file. */
+static void civ_load_pic_palette(const char *path) {
+    size_t n = strlen(path);
+    if (n < 4) return;
+    const char *ext = path + n - 4;
+    if (!(ext[0]=='.' && (ext[1]=='p'||ext[1]=='P') &&
+          (ext[2]=='i'||ext[2]=='I') && (ext[3]=='c'||ext[3]=='C'))) return;
+    FILE *f = fopen(path, "rb");
+    if (!f) return;
+    static uint8_t buf[65536];
+    size_t len = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    size_t o = 0;
+    while (o + 4 <= len) {
+        uint16_t tag = (uint16_t)(buf[o] | (buf[o+1] << 8));
+        if ((tag & 0xFF) == 0x58) break;            /* 'X' image chunk -> done */
+        uint16_t clen = (uint16_t)(buf[o+2] | (buf[o+3] << 8));
+        if (tag == 0x304D && clen >= 0x0302 && o + 6 + 768 <= len) {
+            memcpy(g_pic_pal, buf + o + 6, 768);     /* skip tag,len,2-byte hdr */
+            g_pic_pal_valid = 1;
+            return;
+        }
+        o += 4 + (clen & ~1u);
+    }
+}
+
 void res_01FB68(CPU *cpu) {
     /* Args: [sp+4]=filename_ptr, [sp+6]=mode (0=read binary) */
     uint16_t fn_off = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
@@ -72,6 +106,13 @@ void res_01FB68(CPU *cpu) {
         if (!c) break;
     }
     path[255] = 0;
+
+    /* Capture this PIC's palette (if any) for far_0000_07E6 to upload. */
+    civ_load_pic_palette(path);
+
+    /* Diagnostic: flag when the title background (arch.pic) loads, so main.c can
+     * snapshot the title/menu screen (CIV_DUMPALL). */
+    { extern int g_arch_pic_loaded; if (strstr(path, "arch")) g_arch_pic_loaded = 1; }
 
     /* Open via DOS INT 21h/AH=3D (read-only) */
     DosState *dos = get_dos_state(cpu);
@@ -183,12 +224,33 @@ void far_205A_2096(CPU *cpu)
     if (dos->poll_events)
         dos->poll_events(dos->platform_ctx, dos, cpu);
 
-    /* Auto-inject Space key after 200 polls if no real key pressed.
-     * This advances past "press any key" screens during startup. */
-    if (!keyboard_available(&dos->keyboard) && call_count >= 200 && (call_count % 200) == 0) {
-        keyboard_push(&dos->keyboard, 0x39, 0x20); /* Space: scan=0x39, ascii=0x20 */
-        fprintf(stderr, "[KBHIT] Auto-injected Space at poll #%llu\n",
-                (unsigned long long)call_count);
+    /* Auto-inject a key after 200 polls if no real key pressed.
+     * This advances past "press any key" screens during startup.
+     * Default is Space (any-key screens). Set CIV_AUTOKEY=<char> to inject a
+     * specific ASCII key instead - e.g. CIV_AUTOKEY=n auto-selects New Game at
+     * the title menu (getkey strips the scancode, so ASCII is what matters).
+     * Real keyboard input always takes precedence; this only fires when the
+     * buffer is empty. */
+    /* CIV_AUTOKEY: a sequence of ASCII keys auto-injected (cycling) when the
+     * buffer is empty, to drive menus headlessly. Each screen consumes the key
+     * it accepts and ignores the rest; cycling lets a multi-screen flow advance
+     * (e.g. CIV_AUTOKEY=n4 -> 'n' New Game at the title, '4' difficulty at setup).
+     * Default (env unset) injects a single Space for "press any key" screens.
+     * Real keyboard input always wins. */
+    static const char *ak_seq = 0; static int ak_init = 0, ak_period = 200, ak_idx = 0;
+    if (!ak_init) {
+        ak_init = 1;
+        ak_seq = getenv("CIV_AUTOKEY");
+        if (ak_seq && ak_seq[0]) ak_period = 5; else ak_seq = " ";
+    }
+    if (!keyboard_available(&dos->keyboard) && call_count >= (uint64_t)ak_period &&
+        (call_count % ak_period) == 0) {
+        int len = (int)strlen(ak_seq);
+        uint8_t a = (uint8_t)ak_seq[ak_idx % (len ? len : 1)];
+        ak_idx++;
+        keyboard_push(&dos->keyboard, 0, a);
+        fprintf(stderr, "[KBHIT] Auto-injected key 0x%02X at poll #%llu\n",
+                a, (unsigned long long)call_count);
     }
 
     cpu->ax = keyboard_available(&dos->keyboard) ? 0x00FF : 0x0000;
@@ -196,6 +258,97 @@ void far_205A_2096(CPU *cpu)
         fprintf(stderr, "[KBHIT] #%llu result=%u\n",
                 (unsigned long long)call_count, cpu->ax);
         fflush(stderr);
+    }
+    cpu->sp += 4; /* far ret */
+}
+
+/* far_0000_09DE - blocking keyboard read (INT 16h AH=0 equivalent).
+ * Returns AX = (scancode<<8) | ascii and consumes one key from the buffer.
+ *
+ * Was MIS-ALIASED to ovl12_03D15C (a score-string builder: itoa+strcat) by the
+ * naive link-order thunk assignment. getkey (far_1D1F_0AC9) calls this, so it
+ * read garbage and never returned N/L/E/C; meanwhile the real key sat unconsumed
+ * in the buffer, so kbhit (far_205A_2096) reported "key available" forever and
+ * the title menu spun without ever advancing. Verified by contract, not order
+ * (see the standing warning about the 0x0761 runtime-patched thunk table). */
+void far_0000_09DE(CPU *cpu)
+{
+    extern void platform_delay(uint32_t ms);
+    DosState *dos = get_dos_state(cpu);
+    /* Block until a key is available, pumping SDL so the window stays live and
+     * a small delay keeps us off 100% CPU. The title menu only calls this after
+     * kbhit confirms a key, so in practice it rarely waits. */
+    while (!keyboard_available(&dos->keyboard)) {
+        if (dos->poll_events)
+            dos->poll_events(dos->platform_ctx, dos, cpu);
+        platform_delay(2);
+    }
+    cpu->ax = keyboard_read(&dos->keyboard);
+    static int _kc = 0;
+    if (++_kc <= 8) {
+        fprintf(stderr, "[KEY] far_0000_09DE getkey raw=0x%04X\n", cpu->ax);
+        fflush(stderr);
+    }
+    cpu->sp += 4; /* far ret */
+}
+
+/* ─── New-Game setup input chain (lifted from dump) ───
+ * far_0000_16C6 / far_01A7_0225 / far_1436_0918 are the setup screen's mouse +
+ * keyboard input path. They were no-op STUBs, so the setup's input-wait never
+ * blocked/returned a key and the setup screen spun. Hand-lifted faithfully; all
+ * their deps are implemented (far_0402_44E9 yield, far_205A_2096 kbhit,
+ * far_205A_20AA getch). The cosmetic menu-box draw (far_0181_000C -> the still-
+ * undefined far_0000_0FFC) stays stubbed. See plan_newgame_menu_subsystem.md. */
+extern void far_0402_44E9(CPU *cpu);
+extern void far_205A_2096(CPU *cpu);
+extern void far_205A_20AA(CPU *cpu);
+
+/* far_0000_16C6 - read+clear the mouse-click latch DS:[0x5824] (0 = none). */
+void far_0000_16C6(CPU *cpu)
+{
+    cpu->ax = mem_read16(cpu, cpu->ds, 0x5824);
+    mem_write16(cpu, cpu->ds, 0x5824, 0);
+    cpu->sp += 4; /* far ret */
+}
+
+/* far_01A7_0225 - snapshot mouse/cursor state into DS:[0xEA6A/0xEA6C/0xEA6E].
+ * @0x1C95: if VGA([0x1A3C]): EA6A = mouse_clicks|[0x5822]; EA6C=[0x581E];
+ * EA6E=[0x5820]; else zero all three. */
+void far_01A7_0225(CPU *cpu)
+{
+    if (mem_read16(cpu, cpu->ds, 0x1A3C) != 0) {
+        push16(cpu, cpu->cs); push16(cpu, 0);
+        far_0000_16C6(cpu);                       /* ax = mouse-click latch */
+        cpu->ax |= mem_read16(cpu, cpu->ds, 0x5822);
+        mem_write16(cpu, cpu->ds, 0xEA6A, cpu->ax);
+        mem_write16(cpu, cpu->ds, 0xEA6C, mem_read16(cpu, cpu->ds, 0x581E));
+        mem_write16(cpu, cpu->ds, 0xEA6E, mem_read16(cpu, cpu->ds, 0x5820));
+    } else {
+        mem_write16(cpu, cpu->ds, 0xEA6E, 0);
+        mem_write16(cpu, cpu->ds, 0xEA6C, 0);
+        mem_write16(cpu, cpu->ds, 0xEA6A, 0);
+    }
+    cpu->sp += 4; /* far ret */
+}
+
+/* far_1436_0918 - the setup screen's input wait (@0x14C78). Yields, then loops
+ * polling mouse + keyboard until input, then reads the key via getch.
+ *   yield; loop{ mouse(); if EA6A!=0 break; if kbhit() break; }
+ *   if EA6A==0 { k=getch(); if k==0 getch(); }  ; returns key in AX */
+void far_1436_0918(CPU *cpu)
+{
+    push16(cpu, cpu->cs); push16(cpu, 0); far_0402_44E9(cpu);   /* yield */
+    for (;;) {
+        push16(cpu, cpu->cs); push16(cpu, 0); far_01A7_0225(cpu); /* mouse */
+        if (mem_read16(cpu, cpu->ds, 0xEA6A) != 0) break;
+        push16(cpu, cpu->cs); push16(cpu, 0); far_205A_2096(cpu); /* kbhit */
+        if (cpu->ax != 0) break;
+    }
+    if (mem_read16(cpu, cpu->ds, 0xEA6A) == 0) {
+        push16(cpu, cpu->cs); push16(cpu, 0); far_205A_20AA(cpu); /* getch */
+        if (cpu->ax == 0) {
+            push16(cpu, cpu->cs); push16(cpu, 0); far_205A_20AA(cpu); /* extended */
+        }
     }
     cpu->sp += 4; /* far ret */
 }
@@ -340,37 +493,128 @@ void far_0000_077D(CPU *cpu)
     cpu->sp += 4; /* far ret */
 }
 
-/* ─── GFX: grab screen rect into a sprite, return handle ─── */
-/* far_0000_076F - Capture a rectangle of the active draw page into an
- * off-screen sprite buffer and return a handle.
+/* ─── GFX sprite store: screen-grab capture + blit (far_0000_076F / _083F) ───
+ * The original sprite system: far_0000_076F snapshots a w*h rect of the active
+ * draw page into an off-screen buffer and returns a handle; far_0000_083F later
+ * blits a sprite (by handle, or by a DS-relative pointer to file-loaded sprite
+ * data) onto a gfx page at (x,y). Both ends were no-op stubs, so nothing drew.
+ *
+ * Screen-grab sprites are OURS end-to-end (we control the handle format), so we
+ * implement them with a host-side store keyed by an opaque handle in the 0x4000
+ * range (distinct from real DS offsets, which are small). File-loaded sprites
+ * (logo/font/map tiles) use the GAME's on-disk sprite format, which still needs
+ * RE — far_0000_083F logs those headers (for the next session) and skips them. */
+#define SPRITE_STORE_MAX 256
+typedef struct { int used; int w, h; uint8_t *px; } HostSprite;
+static HostSprite g_sprites[SPRITE_STORE_MAX];
+static int sprite_is_handle(uint16_t v) { return (v & 0xF000) == 0x4000; }
+
+/* far_0000_076F - Capture a rectangle of the active draw page into a host
+ * sprite and return a handle.
  *   Stack params (cdecl): [sp+04] flag  [sp+06] x  [sp+08] y
  *                         [sp+0A] width [sp+0C] height
- * The returned handle (AX) is stored by the caller and later passed to the
- * sprite blitter far_0000_083F. The civ-select dialog ovl02_02CDD7 calls this
- * 24x in a 6x4 grid (49x49 cells) to snapshot the portrait cells.
- *
- * The thunk-table alias previously pointed 0x076F at ovl02_02CDD7 itself,
- * which is the *caller* — producing unbounded recursion. far_0000_083F is
- * currently a no-op stub, so the exact sprite-buffer format is not yet needed:
- * we return a distinct non-zero handle per call so the dialog proceeds and
- * its handle array stays collision-free. When the sprite blitter is
- * implemented this should grab the w*h pixels from the active page. */
+ * The active draw page is the one referenced by the GFX struct at DS:[0xAA].
+ * The civ-select dialog ovl02_02CDD7 calls this 24x in a 6x4 grid to snapshot
+ * portrait cells; the title/menu uses it to save areas under cursors/highlights.
+ * (The old thunk alias wrongly pointed 0x076F at its caller ovl02_02CDD7 ->
+ * recursion; this is the real screen-grab primitive.) */
 void far_0000_076F(CPU *cpu)
 {
-    static uint16_t next_handle = 0;
     uint16_t sp = (uint16_t)(cpu->sp + 4); /* skip far return address */
     int16_t  flag   = (int16_t)mem_read16(cpu, cpu->ss, sp);
     int16_t  x      = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 2));
     int16_t  y      = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 4));
     int16_t  width  = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 6));
     int16_t  height = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 8));
-    (void)flag; (void)x; (void)y; (void)width; (void)height;
+    (void)flag;
 
-    /* Distinct non-zero handle (0x4000 range, avoid 0 and 0xFFFF sentinels). */
-    if (next_handle == 0) next_handle = 0x4000;
-    cpu->ax = next_handle++;
-    if (next_handle == 0) next_handle = 0x4000;
+    /* Source = active draw page (GFX struct at DS:[0xAA]); apply its origin. */
+    uint16_t gfx_ptr = mem_read16(cpu, cpu->ds, 0xAA);
+    uint16_t page    = mem_read16(cpu, cpu->ds, gfx_ptr);
+    int16_t  xo      = (int16_t)mem_read16(cpu, cpu->ds, (uint16_t)(gfx_ptr + 2));
+    int16_t  yo      = (int16_t)mem_read16(cpu, cpu->ds, (uint16_t)(gfx_ptr + 4));
+    uint32_t base    = gfx_page_addr(page);
+    int16_t  gx = (int16_t)(x + xo), gy = (int16_t)(y + yo);
 
+    /* Find a free slot. */
+    int slot = -1;
+    for (int i = 0; i < SPRITE_STORE_MAX; i++) if (!g_sprites[i].used) { slot = i; break; }
+    if (slot < 0 || width <= 0 || height <= 0 || width > 320 || height > 200) {
+        cpu->ax = 0; cpu->sp += 4; return;
+    }
+
+    HostSprite *s = &g_sprites[slot];
+    free(s->px);
+    s->px = (uint8_t *)malloc((size_t)width * height);
+    s->w = width; s->h = height; s->used = 1;
+    if (s->px) {
+        for (int r = 0; r < height; r++) {
+            int srow = gy + r;
+            for (int c = 0; c < width; c++) {
+                int scol = gx + c;
+                uint8_t v = 0;
+                if (srow >= 0 && srow < 200 && scol >= 0 && scol < 320) {
+                    uint32_t a = base + (uint32_t)srow * 320 + (uint32_t)scol;
+                    if (a < MEM_SIZE) v = cpu->mem[a];
+                }
+                s->px[r * width + c] = v;
+            }
+        }
+    }
+    cpu->ax = (uint16_t)(0x4000 | slot);  /* opaque host handle */
+    { static int _g=0; if(++_g<=6) fprintf(stderr,"[SPRITE] grab slot=%d %dx%d @(%d,%d) pg%d\n",slot,width,height,gx,gy,page); }
+    cpu->sp += 4; /* far ret */
+}
+
+/* far_0000_083F - Sprite blitter (thunk; the long-stubbed keystone, 64 callers).
+ *   Stack params (cdecl, caller cleans 8): [sp+04] gfx_ctx  [sp+06] x
+ *                                          [sp+08] y       [sp+0A] sprite
+ * If `sprite` is a host handle (0x4000 range) from far_0000_076F, blit our
+ * captured pixels onto the gfx_ctx page at (x,y), opaque (screen-grab restore).
+ * Otherwise `sprite` is a DS pointer to file-loaded sprite data in the GAME's
+ * format (logo/font/tiles) which we can't decode yet -> log its header for RE
+ * and skip. */
+void far_0000_083F(CPU *cpu)
+{
+    uint16_t sp = (uint16_t)(cpu->sp + 4);
+    uint16_t gfx_ctx = mem_read16(cpu, cpu->ss, sp);
+    int16_t  x       = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 2));
+    int16_t  y       = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 4));
+    uint16_t sprite  = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 6));
+
+    if (sprite_is_handle(sprite)) {
+        int slot = sprite & (SPRITE_STORE_MAX - 1);
+        HostSprite *s = &g_sprites[slot];
+        if (slot < SPRITE_STORE_MAX && s->used && s->px) {
+            uint16_t page = mem_read16(cpu, cpu->ds, gfx_ctx);
+            int16_t  xo   = (int16_t)mem_read16(cpu, cpu->ds, (uint16_t)(gfx_ctx + 2));
+            int16_t  yo   = (int16_t)mem_read16(cpu, cpu->ds, (uint16_t)(gfx_ctx + 4));
+            uint32_t base = gfx_page_addr(page);
+            int16_t  dx = (int16_t)(x + xo), dy = (int16_t)(y + yo);
+            for (int r = 0; r < s->h; r++) {
+                int drow = dy + r; if (drow < 0 || drow >= 200) continue;
+                for (int c = 0; c < s->w; c++) {
+                    int dcol = dx + c; if (dcol < 0 || dcol >= 320) continue;
+                    uint32_t a = base + (uint32_t)drow * 320 + (uint32_t)dcol;
+                    if (a < MEM_SIZE) cpu->mem[a] = s->px[r * s->w + c];
+                }
+            }
+            { static int _b=0; if(++_b<=6) fprintf(stderr,"[SPRITE] blit handle slot=%d %dx%d @(%d,%d)\n",slot,s->w,s->h,x,y); }
+        }
+    } else {
+        /* File-loaded sprite: capture its header bytes once per distinct offset
+         * so the on-disk sprite format can be reverse-engineered next session. */
+        static int logged = 0;
+        if (logged < 12) {
+            logged++;
+            uint32_t a = seg_off(cpu->ds, sprite);
+            fprintf(stderr, "[SPRITE] file-sprite blit gfx=0x%04X x=%d y=%d off=0x%04X hdr:",
+                    gfx_ctx, x, y, sprite);
+            for (int i = 0; i < 16 && a + i < MEM_SIZE; i++)
+                fprintf(stderr, " %02X", cpu->mem[a + i]);
+            fprintf(stderr, "\n"); fflush(stderr);
+        }
+    }
     cpu->sp += 4; /* far ret */
 }
 
@@ -662,6 +906,61 @@ void far_0000_07ED(CPU *cpu)
         }
     }
 
+    cpu->sp += 4; /* far ret */
+}
+
+/* ─── PIC row blitter: far_0000_07E6 ───
+ * Copies one decoded image row (a linear DS buffer) onto a destination GFX page.
+ * The PIC display loop far_1FB6_01A0 decodes each row into DS:0xF0AE then calls
+ * this to place it. Was MIS-ALIASED to ovl05_02FFC2 (which treated arg1, the
+ * source buffer offset, as a page index and dropped the pixels).
+ * Stack params (cdecl far, caller cleans 0xA = 5 words):
+ *   [sp+04] src_off  - DS offset of the source row buffer
+ *   [sp+06] dst_gfx  - DS offset of the destination GFX context (page@+0,
+ *                      x_origin@+2, y_origin@+4) — same convention as 0000_07ED
+ *   [sp+08] x        - destination column
+ *   [sp+0A] y        - destination row
+ *   [sp+0C] width    - pixels to copy */
+void far_0000_07E6(CPU *cpu)
+{
+    uint16_t sp = (uint16_t)(cpu->sp + 4);
+    uint16_t src_off = mem_read16(cpu, cpu->ss, sp);
+    uint16_t dst_gfx = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 2));
+    int16_t  x       = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 4));
+    int16_t  y       = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 6));
+    int16_t  width   = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 8));
+
+    /* Upload the current PIC's palette. far_0000_1080 parsed the PIC's LBM-style
+     * chunks into the header buffer at DS:0xC936; the 'M0' (0x304D) chunk is the
+     * 256-colour VGA palette: [tag 0x304D][len 0x0302][2-byte hdr 00 FF][768 bytes
+     * of 6-bit RGB]. The game never uploads it (its only DAC uploader, the fade
+     * engine, is unwired), so PICs rendered black. Scan for the chunk and copy the
+     * palette into dos->video.palette (already 6-bit). Idempotent per row. */
+    if (g_pic_pal_valid) {
+        DosState *dos = get_dos_state(cpu);
+        for (int i = 0; i < 256; i++) {
+            dos->video.palette[i][0] = g_pic_pal[i*3 + 0] & 0x3F;
+            dos->video.palette[i][1] = g_pic_pal[i*3 + 1] & 0x3F;
+            dos->video.palette[i][2] = g_pic_pal[i*3 + 2] & 0x3F;
+        }
+    }
+
+    uint16_t page = mem_read16(cpu, cpu->ds, dst_gfx);
+    int16_t  xo   = (int16_t)mem_read16(cpu, cpu->ds, (uint16_t)(dst_gfx + 2));
+    int16_t  yo   = (int16_t)mem_read16(cpu, cpu->ds, (uint16_t)(dst_gfx + 4));
+    uint32_t base = gfx_page_addr(page);
+    int16_t  dx = (int16_t)(x + xo), dy = (int16_t)(y + yo);
+
+    if (width > 0 && dy >= 0 && dy < 200) {
+        uint32_t src = seg_off(cpu->ds, src_off);
+        for (int c = 0; c < width; c++) {
+            int cx = dx + c;
+            if (cx < 0 || cx >= 320) continue;
+            uint32_t a = base + (uint32_t)dy * 320 + (uint32_t)cx;
+            if (a < MEM_SIZE && src + c < MEM_SIZE)
+                cpu->mem[a] = cpu->mem[src + c];
+        }
+    }
     cpu->sp += 4; /* far ret */
 }
 
@@ -1419,23 +1718,24 @@ void far_205A_2AC0(CPU *cpu)
  * Returns AX = next timing value. Used in animation loop timing.
  * With animation skipped, this rarely gets called but we implement it
  * to avoid issues if other code paths use it. */
+/* far_1DDE_007C == res_01DE5C (resident 0x1DE5C): signed int clamp.
+ *   return min(max(value, lo), hi)
+ * Args (far): [sp+4]=value, [sp+6]=lo, [sp+8]=hi.
+ *
+ * Previously mis-implemented as a "delay" that returned arg3 (the hi bound).
+ * The terrain-reveal state machine (ovl07_035B6E) stores this return into its
+ * timer target 0x6798 via clamp(per_tile, 0x2D*0x6798+timer, 0x7FFF); returning
+ * 0x7FFF made the target ~32767 ticks (~30 min) so the reveal's "wait until
+ * timer>=target" loop spun forever and the game never reached the map. The
+ * correct clamp yields a small next-step target so the reveal advances. */
 void far_1DDE_007C(CPU *cpu)
 {
-    uint16_t sp = (uint16_t)(cpu->sp + 4);
-    uint16_t arg1 = mem_read16(cpu, cpu->ss, sp);
-    uint16_t arg2 = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 2));
-    uint16_t arg3 = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 4));
-
-    static int call_count = 0;
-    call_count++;
-    if (call_count <= 5) {
-        fprintf(stderr, "[DELAY] far_1DDE_007C #%d args=(%u, %u, %u)\n",
-                call_count, arg1, arg2, arg3);
-        fflush(stderr);
-    }
-
-    /* Return the target time to indicate we've reached it */
-    cpu->ax = arg3;
+    int16_t value = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
+    int16_t lo    = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 6));
+    int16_t hi    = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 8));
+    if (value < lo) value = lo;
+    if (value > hi) value = hi;
+    cpu->ax = (uint16_t)value;
     cpu->sp += 4; /* far ret */
 }
 
@@ -1661,14 +1961,81 @@ void far_0402_44E9(CPU *cpu)
     fprintf(stderr, "[YIELD] RETURNING sp=%04X\n", cpu->sp); fflush(stderr);
 }
 
+/* ─── res_02120A: MSC _getbuf (un-stubbed 2026-05-31, task #7) ───
+ * Allocates a FILE's 512-byte stream buffer on first read and inits the
+ * descriptor (cnt=0, ptr=buf) so the getc/fread chain then calls the real
+ * _filbuf to read. Faithful lift from the dump (CIV.EXE _getbuf @0x2120A,
+ * NEAR). The far call to 0x215A:0x1BB2 is the MSC buffer allocator, lifted as
+ * res_022138 (far). king.txt (opened by the REAL MSC fopen far_205A_0696) is
+ * read through this path; the prior no-op stub left FILE cnt/ptr garbage. */
+void res_022138(CPU *cpu);  /* MSC malloc/_getbuf-core (far), civ_recomp_006.c */
+void res_02120A(CPU *cpu)
+{
+    push16(cpu, cpu->bp);                    /* push bp */
+    cpu->bp = (uint16_t)(cpu->sp);           /* mov bp, sp */
+    cpu->sp = (uint16_t)(flags_sub16(cpu, cpu->sp, 0x2)); /* sub sp, 0x2 */
+    push16(cpu, cpu->si);                    /* push si */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x4))); /* mov ax, word ss:[bp+0x4] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 0x590A)); /* sub ax, 0x590A */
+    cpu->cl = (uint8_t)(0x3);                /* mov cl, 0x3 */
+    { int16_t _v = (int16_t)cpu->ax; uint8_t _c = cpu->cl; int16_t _r = _v >> _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (_c - 1)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, (uint16_t)_r); cpu->ax = (uint16_t)((uint16_t)_r); } /* sar ax, cl */
+    cpu->cx = (uint16_t)(cpu->ax);           /* mov cx, ax */
+    { uint16_t _v = cpu->ax; uint8_t _c = 0x1; uint16_t _r = _v << _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (16 - _c)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* shl ax, 0x1 */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, cpu->cx)); /* add ax, cx */
+    { uint16_t _v = cpu->ax; uint8_t _c = 0x1; uint16_t _r = _v << _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (16 - _c)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* shl ax, 0x1 */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 0x59AA)); /* add ax, 0x59AA */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x2), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x2], ax */
+    cpu->ax = (uint16_t)(0x200);             /* mov ax, 0x200 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_022138(cpu);                         /* call 215A:1BB2 (MSC buffer alloc) */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x4))); /* mov bx, word ss:[bp+0x4] */
+    mem_write16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x4), (uint16_t)(cpu->ax)); /* mov word ds:[bx+0x4], ax */
+    { uint16_t _r = cpu->ax | cpu->ax; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* or ax, ax */
+    if (cc_e(cpu)) goto L_res_02120A_000044; /* je 0x0044 */
+    { uint8_t _r = mem_read8(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x6)) | 0x8; flags_logic8(cpu, _r); mem_write8(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x6), (uint8_t)(_r)); } /* or byte ds:[bx+0x6], 0x8 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x2))); /* mov bx, word ss:[bp+-0x2] */
+    mem_write16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x2), (uint16_t)(0x200)); /* mov word ds:[bx+0x2], 0x200 */
+    goto L_res_02120A_00005A;                /* jmp 0x005A */
+L_res_02120A_000044:;
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x4))); /* mov bx, word ss:[bp+0x4] */
+    { uint8_t _r = mem_read8(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x6)) | 0x4; flags_logic8(cpu, _r); mem_write8(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x6), (uint8_t)(_r)); } /* or byte ds:[bx+0x6], 0x4 */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x2))); /* mov ax, word ss:[bp+-0x2] */
+    { int _cf = cf(cpu); cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 1)); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc ax */
+    mem_write16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x4), (uint16_t)(cpu->ax)); /* mov word ds:[bx+0x4], ax */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x2))); /* mov bx, word ss:[bp+-0x2] */
+    mem_write16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x2), (uint16_t)(0x1)); /* mov word ds:[bx+0x2], 0x1 */
+L_res_02120A_00005A:;
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x4))); /* mov bx, word ss:[bp+0x4] */
+    cpu->si = (uint16_t)(cpu->bx);           /* mov si, bx */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, (uint16_t)(cpu->si + 0x4))); /* mov ax, word ds:[si+0x4] */
+    mem_write16(cpu, cpu->ds, cpu->bx, (uint16_t)(cpu->ax)); /* mov word ds:[bx], ax */
+    mem_write16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x2), (uint16_t)(0x0)); /* mov word ds:[bx+0x2], 0x0 */
+    cpu->si = (uint16_t)(pop16(cpu));        /* pop si */
+    cpu->sp = (uint16_t)(cpu->bp);           /* mov sp, bp */
+    cpu->bp = (uint16_t)(pop16(cpu));        /* pop bp */
+    cpu->sp += 2; return;                    /* ret */
+}
+
 /* ─── Traced alias wrappers ─── */
-/* far_0000_0768 - Alias for ovl02_02C200 (title screen, now bypassed) */
+/* far_0000_0768 - Alias for ovl02_02C200 (title screen, now un-bypassed) */
 void ovl02_02C200(CPU *cpu);  /* forward decl - defined below */
+/* far_0000_0768 - Free-memory query (resident offset 0x0768), called in
+ * res_001A66 AFTER the title (ovl02_02C200) to decide whether to show the
+ * *LOMEM low-memory warning. res_001A66 compares the return value (AX) against
+ * a threshold (0xFA0 or 0x1F40); if AX < threshold it loads king.txt's *LOMEM
+ * message and shows a dialog that then blocks the whole startup.
+ *
+ * This was previously (wrongly) aliased to ovl02_02C200: it happened to work
+ * only while the title was a stub returning AX=0x6000. With the title now
+ * UN-BYPASSED, calling ovl02_02C200 here both re-ran the title and returned a
+ * small AX -> LOMEM false alarm. We have ample host memory, so report a large
+ * free-memory figure (>= the 0x1F40 graphics threshold) to skip LOMEM. */
 void far_0000_0768(CPU *cpu)
 {
-    fprintf(stderr, "[TRACE] far_0000_0768 -> ovl02_02C200 (bypassed) sp=%04X\n",
-            cpu->sp);
-    ovl02_02C200(cpu);
+    cpu->ax = 0x6000;   /* plenty of free memory; skip *LOMEM warning */
+    cpu->sp += 4;       /* far ret */
 }
 
 /* far_0000_0792 - Alias for ovl03_02DED7 (civ info screen).
@@ -2243,9 +2610,10 @@ void far_205A_20C2(CPU *cpu)
 
         /* Pre-load '1' key (scancode 0x02, ascii '1') into keyboard buffer
          * so the next far_0000_09E5 call reads it immediately. */
-        if (!keyboard_available(&dos->keyboard)) {
-            keyboard_push(&dos->keyboard, 0x02, '1');
-        }
+        /* (Removed the '1' auto-inject: it was a hack for the now-bypassed
+         * intro's digit-validation loop, but it pollutes the title menu's
+         * getkey, which only accepts N/L/E/C. Real input / CIV_AUTOKEY drive
+         * the menu now.) */
     }
 
     cpu->sp += 4; /* far ret */
@@ -2324,6 +2692,25 @@ void ovl01_02BA00(CPU *cpu)
     uint16_t check = mem_read16(cpu, cpu->ds, 0x1A3C);
     fprintf(stderr, "[INTRO] DS:0x1A3C = %u (expected 1)\n", check);
 
+    /* The real intro establishes MCGA mode 13h (320x200x256) before any
+     * graphics are drawn; main's res_001CAE (the proper mode setter) sits
+     * after the title attract loop and is never reached, so replicate the
+     * intro's side effect here. Set the mode ONCE: the attract loop re-enters
+     * this bypass every iteration, and re-running the BIOS mode-set would
+     * memset A0000 and wipe the title that was just drawn. Only do the
+     * mode set (and its framebuffer clear) on the first transition into 13h. */
+    if (mem_read8(cpu, 0x0040, 0x0049) != 0x13) {
+        extern void bios_int10(CPU *cpu);
+        uint16_t saved_ax = cpu->ax;
+        cpu->ax = 0x0013;       /* AH=00 set mode, AL=13h */
+        bios_int10(cpu);
+        cpu->ax = saved_ax;
+        /* Keep res_001CAE's VGA ref count consistent so a later real call
+         * (ref 0->1) won't re-issue the mode set and clear the screen. */
+        mem_write16(cpu, cpu->ds, 0xEE1A, 1);
+        fprintf(stderr, "[INTRO] Set MCGA mode 13h (A0000 graphics)\n");
+    }
+
     cpu->sp += 4; /* far ret */
 }
 
@@ -2392,22 +2779,1402 @@ void res_0224EE(CPU *cpu)
 }
 
 /* ─── Title screen bypass ─── */
-/* ovl02_02C200 - Title screen + menu. BYPASSED (stable). The CRT text-stream
- * chain (res_021BC8/021BEC/021C22/02178A + far_215A_16DA ungetc, above) is now
- * implemented, so un-bypassing no longer spins on credits.txt. It DOES run the
- * real intro (logo/birth/credits) but then hits a separate bad-filename pointer
- * bug (opens a static EXE string ~DGROUP:0x2B10 = the "Action canceled" msg)
- * + res_02120A, and exits. That pointer bug is the next blocker to the menu.
- * Skips to New Game for now. See session 2026-05-31, task #5. */
+/* ovl02_02C200 - Title screen + intro + main menu (N/L/E/C key handler).
+ * UN-BYPASSED 2026-05-31 (task #6): real lifted body (CIV.EXE @0x2C200,
+ * 1121 insts). Runs logo/birth/credits via the CRT text chain, then the
+ * menu at the tail (sets [0x6AC2] from N/L/E/C). To re-bypass, restore the
+ * stub from civ_impl.c.prebypass.bak. */
+extern void far_0000_0000(CPU *cpu);
+extern void far_0000_0330(CPU *cpu);
+extern void far_0000_0374(CPU *cpu);
+extern void far_0000_03EC(CPU *cpu);
+extern void far_0000_041D(CPU *cpu);
+extern void far_0000_065C(CPU *cpu);
+extern void far_0000_0761(CPU *cpu);
+extern void far_0000_076F(CPU *cpu);
+extern void far_0000_0792(CPU *cpu);
+extern void far_0000_07A7(CPU *cpu);
+extern void far_0000_07DF(CPU *cpu);
+extern void far_0000_07ED(CPU *cpu);
+extern void far_0000_0810(CPU *cpu);
+extern void far_0000_081E(CPU *cpu);
+extern void far_0000_0838(CPU *cpu);
+extern void far_0000_083F(CPU *cpu);
+extern void far_0000_0864(CPU *cpu);
+extern void far_0000_0A1D(CPU *cpu);
+extern void far_0000_0A40(CPU *cpu);
+extern void far_0000_0BEC(CPU *cpu);
+extern void far_0402_44E9(CPU *cpu);
+extern void far_1D1F_0AC9(CPU *cpu);
+extern void far_1DDE_0042(CPU *cpu);
+extern void far_1DDE_0523(CPU *cpu);
+extern void far_1FB6_021E(CPU *cpu);
+extern void far_1FB6_026A(CPU *cpu);
+extern void far_205A_1E60(CPU *cpu);
+extern void far_205A_2096(CPU *cpu);
+extern void far_205A_20AA(CPU *cpu);
+extern void ovl02_02DBA3(CPU *cpu);
+extern void res_000A54(CPU *cpu);
+extern void res_000B4E(CPU *cpu);
+extern void res_00102D(CPU *cpu);
+extern void res_0018B1(CPU *cpu);
+extern void res_001932(CPU *cpu);
+extern void res_001A0F(CPU *cpu);
+extern void res_001A5A(CPU *cpu);
+extern void res_001D02(CPU *cpu);
+extern void res_001ECA(CPU *cpu);
+extern void res_002339(CPU *cpu);
+extern void res_020C1C(CPU *cpu);
+extern void res_022418(CPU *cpu);
+
 void ovl02_02C200(CPU *cpu)
 {
-    fprintf(stderr, "[TITLE] Bypassing title screen -> New Game\n");
-    mem_write16(cpu, cpu->ds, 0x6AC2, 0x0000);
-    mem_write16(cpu, cpu->ds, 0xEDEA, 0x0000);
-    mem_write16(cpu, cpu->ds, 0xE692, 0x0000);
-    mem_write16(cpu, cpu->ds, 0xC13E, 0x0000);
-    cpu->ax = 0x6000;
-    cpu->sp += 4; /* far ret */
+    push16(cpu, cpu->bp);                    /* push bp */
+    cpu->bp = (uint16_t)(cpu->sp);           /* mov bp, sp */
+    cpu->sp = (uint16_t)(flags_sub16(cpu, cpu->sp, 0x4E)); /* sub sp, 0x4E */
+    push16(cpu, cpu->si);                    /* push si */
+    mem_write16(cpu, cpu->ds, 0xEDEA, (uint16_t)(0x1)); /* mov word ds:[0xEDEA], 0x1 */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(0x1)); /* mov word ss:[bp+-0x48], 0x1 */
+L_ovl02_02C200_000012:;
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_001D02(cpu);                         /* call 01A7:02A6 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x6)); /* add sp, 0x6 */
+    { uint16_t _r = cpu->ax | cpu->ax; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* or ax, ax */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000035; /* je 0x0035 */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* mov ax, word ss:[bp+-0x48] */
+    { int _cf = cf(cpu); cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 1)); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc ax */
+    mem_write16(cpu, cpu->ds, 0xEDEA, (uint16_t)(cpu->ax)); /* mov word ds:[0xEDEA], ax */
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x48] */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x8); /* cmp word ss:[bp+-0x48], 0x8 */
+    if (cc_l(cpu)) goto L_ovl02_02C200_000012; /* jl 0x0012 */
+L_ovl02_02C200_000035:;
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x4C), (uint16_t)(0x0)); /* mov word ss:[bp+-0x4C], 0x0 */
+L_ovl02_02C200_00003A:;
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x31FA);            /* mov ax, 0x31FA */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_065C(cpu);                      /* call 0000:065C */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x4)); /* add sp, 0x4 */
+    { int _cf = cf(cpu); cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 1)); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc ax */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000051; /* je 0x0051 */
+    cpu->ax = (uint16_t)(0x1);               /* mov ax, 0x1 */
+    goto L_ovl02_02C200_000053;              /* jmp 0x0053 */
+L_ovl02_02C200_000051:;
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+L_ovl02_02C200_000053:;
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x4C), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x4C], ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xC);               /* mov ax, 0xC */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_002339(cpu);                         /* call 01A7:08DD */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x4)); /* add sp, 0x4 */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(0x1)); /* mov word ss:[bp+-0x48], 0x1 */
+L_ovl02_02C200_00006A:;
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x31F8)); /* push word ds:[0x31F8] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_001A5A(cpu);                         /* call 0198:00EE */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x48] */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0xC); /* cmp word ss:[bp+-0x48], 0xC */
+    if (cc_le(cpu)) goto L_ovl02_02C200_00006A; /* jle 0x006A */
+    cpu->ax = (uint16_t)(0x3203);            /* mov ax, 0x3203 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xD);               /* mov ax, 0xD */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_001A0F(cpu);                         /* call 0198:00A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x6)); /* add sp, 0x6 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x4C)), 0x0); /* cmp word ss:[bp+-0x4C], 0x0 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_0000AE; /* je 0x00AE */
+    cpu->ax = (uint16_t)(0x3206);            /* mov ax, 0x3206 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x1D);              /* mov ax, 0x1D */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x10);              /* mov ax, 0x10 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_001A0F(cpu);                         /* call 0198:00A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x6)); /* add sp, 0x6 */
+    goto L_ovl02_02C200_0000E5;              /* jmp 0x00E5 */
+L_ovl02_02C200_0000AE:;
+    cpu->ax = (uint16_t)(0x321B);            /* mov ax, 0x321B */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_205A_1E60(cpu);                      /* call 205A:1E60 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x4)); /* add sp, 0x4 */
+    cpu->ax = (uint16_t)(0x6);               /* mov ax, 0x6 */
+    cpu->dx = (cpu->ax & 0x8000) ? 0xFFFF : 0x0000; /* cwd */
+    cpu->cx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xEDEA)); /* mov cx, word ds:[0xEDEA] */
+    { int32_t _n = (int32_t)(((uint32_t)cpu->dx << 16) | cpu->ax); int16_t _d = (int16_t)cpu->cx; cpu->ax = (uint16_t)(int16_t)(_n / _d); cpu->dx = (uint16_t)(int16_t)(_n % _d); } /* idiv cx */
+    mem_write8(cpu, cpu->ds, 0xC949, (uint8_t)(flags_add8(cpu, mem_read8(cpu, cpu->ds, 0xC949), cpu->al))); /* add byte ds:[0xC949], al */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x1D);              /* mov ax, 0x1D */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x10);              /* mov ax, 0x10 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_001A0F(cpu);                         /* call 0198:00A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x6)); /* add sp, 0x6 */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_205A_20AA(cpu);                      /* call 205A:20AA */
+L_ovl02_02C200_0000E5:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x4C)), 0x0); /* cmp word ss:[bp+-0x4C], 0x0 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0000EE; /* jne 0x00EE */
+    goto L_ovl02_02C200_00003A;              /* jmp 0x003A */
+L_ovl02_02C200_0000EE:;
+    flags_cmp8(cpu, mem_read8(cpu, cpu->ds, 0x1A22), 0x6D); /* cmp byte ds:[0x1A22], 0x6D */
+    if (cc_e(cpu)) goto L_ovl02_02C200_0000FC; /* je 0x00FC */
+    flags_cmp8(cpu, mem_read8(cpu, cpu->ds, 0x1A22), 0x4D); /* cmp byte ds:[0x1A22], 0x4D */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000101; /* jne 0x0101 */
+L_ovl02_02C200_0000FC:;
+    cpu->ax = (uint16_t)(0x1);               /* mov ax, 0x1 */
+    goto L_ovl02_02C200_000103;              /* jmp 0x0103 */
+L_ovl02_02C200_000101:;
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+L_ovl02_02C200_000103:;
+    mem_write16(cpu, cpu->ds, 0xE692, (uint16_t)(cpu->ax)); /* mov word ds:[0xE692], ax */
+    flags_cmp8(cpu, mem_read8(cpu, cpu->ds, 0x1A22), 0x65); /* cmp byte ds:[0x1A22], 0x65 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000114; /* je 0x0114 */
+    flags_cmp8(cpu, mem_read8(cpu, cpu->ds, 0x1A22), 0x45); /* cmp byte ds:[0x1A22], 0x45 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000119; /* jne 0x0119 */
+L_ovl02_02C200_000114:;
+    cpu->ax = (uint16_t)(0x1);               /* mov ax, 0x1 */
+    goto L_ovl02_02C200_00011B;              /* jmp 0x011B */
+L_ovl02_02C200_000119:;
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+L_ovl02_02C200_00011B:;
+    mem_write16(cpu, cpu->ds, 0xC13E, (uint16_t)(cpu->ax)); /* mov word ds:[0xC13E], ax */
+    cpu->ax = (uint16_t)(0x3231);            /* mov ax, 0x3231 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x1A22);            /* mov ax, 0x1A22 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_000A54(cpu);                         /* call 0000:0A68 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x4)); /* add sp, 0x4 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_000B4E(cpu);                         /* call 0000:0B62 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x1A30);            /* mov ax, 0x1A30 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_000A54(cpu);                         /* call 0000:0A68 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x4)); /* add sp, 0x4 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_000B4E(cpu);                         /* call 0000:0B62 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    cpu->bx = (uint16_t)(flags_sub16(cpu, cpu->bx, cpu->bx)); /* sub bx, bx */
+    cpu->es = (uint16_t)(cpu->bx);           /* mov es, bx */
+    cpu->bx = (uint16_t)(0x417);             /* mov bx, 0x417 */
+    { uint8_t _r = mem_read8(cpu, cpu->es, cpu->bx) & 0xDF; flags_logic8(cpu, _r); mem_write8(cpu, cpu->es, cpu->bx, (uint8_t)(_r)); } /* and byte es:[bx], 0xDF */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    mem_write16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x10), (uint16_t)(0x1)); /* mov word ds:[bx+0x10], 0x1 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0864(cpu);                      /* call 0000:0864 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    mem_write16(cpu, cpu->ds, 0x6D8C, (uint16_t)(0x0)); /* mov word ds:[0x6D8C], 0x0 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000180; /* je 0x0180 */
+    cpu->ax = (uint16_t)(0x3);               /* mov ax, 0x3 */
+    goto L_ovl02_02C200_000183;              /* jmp 0x0183 */
+L_ovl02_02C200_000180:;
+    cpu->ax = (uint16_t)(0x4);               /* mov ax, 0x4 */
+L_ovl02_02C200_000183:;
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x2), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x2], ax */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(0x0)); /* mov word ss:[bp+-0x48], 0x0 */
+    goto L_ovl02_02C200_000196;              /* jmp 0x0196 */
+L_ovl02_02C200_00018D:;
+    mem_write16(cpu, cpu->ds, 0x6D8C, (uint16_t)(0x1)); /* mov word ds:[0x6D8C], 0x1 */
+L_ovl02_02C200_000193:;
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x48] */
+L_ovl02_02C200_000196:;
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x2))); /* mov ax, word ss:[bp+-0x2] */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), cpu->ax); /* cmp word ss:[bp+-0x48], ax */
+    if (cc_ge(cpu)) goto L_ovl02_02C200_0001BE; /* jge 0x01BE */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0761(cpu);                      /* call 0000:0761 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    mem_write16(cpu, cpu->ds, 0x3286, (uint16_t)(cpu->ax)); /* mov word ds:[0x3286], ax */
+    { uint16_t _r = cpu->ax | cpu->ax; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* or ax, ax */
+    if (cc_e(cpu)) goto L_ovl02_02C200_00018D; /* je 0x018D */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0810(cpu);                      /* call 0000:0810 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x4)); /* add sp, 0x4 */
+    goto L_ovl02_02C200_000193;              /* jmp 0x0193 */
+L_ovl02_02C200_0001BE:;
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0000(cpu);                      /* call 0000:0000 */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0A1D(cpu);                      /* call 0000:0A1D */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_1DDE_0042(cpu);                      /* call 1DDE:0042 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xC8);              /* mov ax, 0xC8 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0BEC(cpu);                      /* call 0000:0BEC */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0xC)); /* add sp, 0xC */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_00020A; /* jne 0x020A */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xC8);              /* mov ax, 0xC8 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19FC)); /* push word ds:[0x19FC] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0BEC(cpu);                      /* call 0000:0BEC */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0xC)); /* add sp, 0xC */
+L_ovl02_02C200_00020A:;
+    cpu->ax = (uint16_t)(0x19FE);            /* mov ax, 0x19FE */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_081E(cpu);                      /* call 0000:081E */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07DF(cpu);                      /* call 0000:07DF */
+    cpu->ax = (uint16_t)(0x323A);            /* mov ax, 0x323A */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x1);               /* mov ax, 0x1 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_1FB6_021E(cpu);                      /* call 1FB6:021E */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x4)); /* add sp, 0x4 */
+    cpu->ax = (uint16_t)(0x50);              /* mov ax, 0x50 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x40);              /* mov ax, 0x40 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x1);               /* mov ax, 0x1 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_076F(cpu);                      /* call 0000:076F */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0xA)); /* add sp, 0xA */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x4E), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x4E], ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0792(cpu);                      /* call 0000:0792 */
+    cpu->ax = (uint16_t)(0x3243);            /* mov ax, 0x3243 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x1);               /* mov ax, 0x1 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_1FB6_021E(cpu);                      /* call 1FB6:021E */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x4)); /* add sp, 0x4 */
+    cpu->ax = (uint16_t)(0xB0);              /* mov ax, 0xB0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    cpu->ax = (uint16_t)(0x18);              /* mov ax, 0x18 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x4C);              /* mov ax, 0x4C */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+    cpu->ax = (uint16_t)(0x324E);            /* mov ax, 0x324E */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x2);               /* mov ax, 0x2 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_1FB6_021E(cpu);                      /* call 1FB6:021E */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x4)); /* add sp, 0x4 */
+    cpu->ax = (uint16_t)(0xB0);              /* mov ax, 0xB0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19E8)); /* push word ds:[0x19E8] */
+    cpu->ax = (uint16_t)(0x18);              /* mov ax, 0x18 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x4C);              /* mov ax, 0x4C */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19E8)); /* push word ds:[0x19E8] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+    cpu->ax = (uint16_t)(0x3259);            /* mov ax, 0x3259 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_1FB6_026A(cpu);                      /* call 1FB6:026A */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xB0);              /* mov ax, 0xB0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xC);               /* mov ax, 0xC */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0BEC(cpu);                      /* call 0000:0BEC */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0xC)); /* add sp, 0xC */
+    cpu->ax = (uint16_t)(0x98);              /* mov ax, 0x98 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x92);              /* mov ax, 0x92 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xE);               /* mov ax, 0xE */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x1);               /* mov ax, 0x1 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0374(cpu);                      /* call 0000:0374 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_00031C; /* je 0x031C */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(0x1)); /* mov word ss:[bp+-0x48], 0x1 */
+L_ovl02_02C200_000308:;
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_03EC(cpu);                      /* call 0000:03EC */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x48] */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x3); /* cmp word ss:[bp+-0x48], 0x3 */
+    if (cc_le(cpu)) goto L_ovl02_02C200_000308; /* jle 0x0308 */
+L_ovl02_02C200_00031C:;
+    { uint8_t _r = mem_read8(cpu, cpu->ds, 0x19C0) | 0x10; flags_logic8(cpu, _r); mem_write8(cpu, cpu->ds, 0x19C0, (uint8_t)(_r)); } /* or byte ds:[0x19C0], 0x10 */
+    cpu->ax = (uint16_t)(0x3262);            /* mov ax, 0x3262 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x3265);            /* mov ax, 0x3265 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_020C1C(cpu);                         /* call 205A:0696 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x4)); /* add sp, 0x4 */
+    mem_write16(cpu, cpu->ds, 0xE698, (uint16_t)(cpu->ax)); /* mov word ds:[0xE698], ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0330(cpu);                      /* call 0000:0330 */
+    cpu->ax = (uint16_t)(0x3);               /* mov ax, 0x3 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_001ECA(cpu);                         /* call 01A7:046E */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    mem_write8(cpu, cpu->ds, 0xC936, (uint8_t)(0x0)); /* mov byte ds:[0xC936], 0x0 */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(0x0)); /* mov word ss:[bp+-0x48], 0x0 */
+    goto L_ovl02_02C200_0004D2;              /* jmp 0x04D2 */
+L_ovl02_02C200_000352:;
+    cpu->ax = (uint16_t)(0x7);               /* mov ax, 0x7 */
+L_ovl02_02C200_000355:;
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xB8);              /* mov ax, 0xB8 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xA0);              /* mov ax, 0xA0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_0018B1(cpu);                         /* call 0181:00B5 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000376; /* je 0x0376 */
+    cpu->ax = (uint16_t)(0xF8);              /* mov ax, 0xF8 */
+    goto L_ovl02_02C200_000379;              /* jmp 0x0379 */
+L_ovl02_02C200_000376:;
+    cpu->ax = (uint16_t)(0xF);               /* mov ax, 0xF */
+L_ovl02_02C200_000379:;
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xB6);              /* mov ax, 0xB6 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xA0);              /* mov ax, 0xA0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_0018B1(cpu);                         /* call 0181:00B5 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_00039A; /* je 0x039A */
+    cpu->ax = (uint16_t)(0xFA);              /* mov ax, 0xFA */
+    goto L_ovl02_02C200_00039D;              /* jmp 0x039D */
+L_ovl02_02C200_00039A:;
+    cpu->ax = (uint16_t)(0xF);               /* mov ax, 0xF */
+L_ovl02_02C200_00039D:;
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xB7);              /* mov ax, 0xB7 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xA0);              /* mov ax, 0xA0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_0018B1(cpu);                         /* call 0181:00B5 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x44))); /* mov ax, word ss:[bp+-0x44] */
+    mem_write16(cpu, cpu->ds, cpu->bx, (uint16_t)(cpu->ax)); /* mov word ds:[bx], ax */
+L_ovl02_02C200_0003BB:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0003D4; /* jne 0x03D4 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, cpu->bx), 0x0); /* cmp word ds:[bx], 0x0 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_0003CF; /* je 0x03CF */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    goto L_ovl02_02C200_0003D2;              /* jmp 0x03D2 */
+L_ovl02_02C200_0003CF:;
+    cpu->ax = (uint16_t)(0x3);               /* mov ax, 0x3 */
+L_ovl02_02C200_0003D2:;
+    mem_write16(cpu, cpu->ds, cpu->bx, (uint16_t)(cpu->ax)); /* mov word ds:[bx], ax */
+L_ovl02_02C200_0003D4:;
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)))); /* sub ax, word ss:[bp+-0x48] */
+    cpu->si = (uint16_t)(cpu->ax);           /* mov si, ax */
+    cpu->ax = (uint16_t)(0xC);               /* mov ax, 0xC */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->si);                    /* push si */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    cpu->ax = (uint16_t)(0x40);              /* mov ax, 0x40 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+    cpu->ax = (uint16_t)(0x4C);              /* mov ax, 0x4C */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    cpu->ax = (uint16_t)(0x18);              /* mov ax, 0x18 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xB0);              /* mov ax, 0xB0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+    cpu->ax = (uint16_t)(0x64);              /* mov ax, 0x64 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->si);                    /* push si */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    cpu->ax = (uint16_t)(0x58);              /* mov ax, 0x58 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000476; /* jne 0x0476 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, cpu->bx)); /* mov ax, word ds:[bx] */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x44), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x44], ax */
+    mem_write16(cpu, cpu->ds, cpu->bx, (uint16_t)(0x0)); /* mov word ds:[bx], 0x0 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->bx);                    /* push bx */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_00102D(cpu);                         /* call 0000:1041 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x44))); /* mov ax, word ss:[bp+-0x44] */
+    mem_write16(cpu, cpu->ds, cpu->bx, (uint16_t)(cpu->ax)); /* mov word ds:[bx], ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0838(cpu);                      /* call 0000:0838 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_000476:;
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0A40(cpu);                      /* call 0000:0A40 */
+    cpu->cx = (uint16_t)(cpu->ax);           /* mov cx, ax */
+    cpu->ax = (uint16_t)(0x15);              /* mov ax, 0x15 */
+    { int32_t _r = (int32_t)(int16_t)cpu->ax * (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)); cpu->ax = (uint16_t)_r; cpu->dx = (uint16_t)((uint32_t)_r >> 16); cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | ((uint32_t)_r != (uint32_t)(int32_t)(int16_t)_r ? FLAG_CF|FLAG_OF : 0); } /* imul word ss:[bp+-0x48] */
+    cpu->bx = (uint16_t)(cpu->cx);           /* mov bx, cx */
+    cpu->dx = (cpu->ax & 0x8000) ? 0xFFFF : 0x0000; /* cwd */
+    { uint16_t _r = cpu->ax ^ cpu->dx; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* xor ax, dx */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->dx)); /* sub ax, dx */
+    cpu->cx = (uint16_t)(0x2);               /* mov cx, 0x2 */
+    { int16_t _v = (int16_t)cpu->ax; uint8_t _c = cpu->cl; int16_t _r = _v >> _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (_c - 1)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, (uint16_t)_r); cpu->ax = (uint16_t)((uint16_t)_r); } /* sar ax, cl */
+    { uint16_t _r = cpu->ax ^ cpu->dx; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* xor ax, dx */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->dx)); /* sub ax, dx */
+    flags_cmp16(cpu, cpu->ax, cpu->bx);      /* cmp ax, bx */
+    if (cc_ge(cpu)) goto L_ovl02_02C200_0004A0; /* jge 0x04A0 */
+    flags_logic8(cpu, mem_read8(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)) & 0x1); /* test byte ss:[bp+-0x48], 0x1 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0004A0; /* jne 0x04A0 */
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x48] */
+L_ovl02_02C200_0004A0:;
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0A40(cpu);                      /* call 0000:0A40 */
+    cpu->cx = (uint16_t)(cpu->ax);           /* mov cx, ax */
+    cpu->ax = (uint16_t)(0x15);              /* mov ax, 0x15 */
+    { int32_t _r = (int32_t)(int16_t)cpu->ax * (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)); cpu->ax = (uint16_t)_r; cpu->dx = (uint16_t)((uint32_t)_r >> 16); cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | ((uint32_t)_r != (uint32_t)(int32_t)(int16_t)_r ? FLAG_CF|FLAG_OF : 0); } /* imul word ss:[bp+-0x48] */
+    cpu->bx = (uint16_t)(cpu->cx);           /* mov bx, cx */
+    cpu->dx = (cpu->ax & 0x8000) ? 0xFFFF : 0x0000; /* cwd */
+    { uint16_t _r = cpu->ax ^ cpu->dx; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* xor ax, dx */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->dx)); /* sub ax, dx */
+    cpu->cx = (uint16_t)(0x2);               /* mov cx, 0x2 */
+    { int16_t _v = (int16_t)cpu->ax; uint8_t _c = cpu->cl; int16_t _r = _v >> _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (_c - 1)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, (uint16_t)_r); cpu->ax = (uint16_t)((uint16_t)_r); } /* sar ax, cl */
+    { uint16_t _r = cpu->ax ^ cpu->dx; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* xor ax, dx */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->dx)); /* sub ax, dx */
+    flags_cmp16(cpu, cpu->ax, cpu->bx);      /* cmp ax, bx */
+    if (cc_g(cpu)) goto L_ovl02_02C200_0004A0; /* jg 0x04A0 */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_205A_2096(cpu);                      /* call 205A:2096 */
+    { uint16_t _r = cpu->ax | cpu->ax; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* or ax, ax */
+    if (cc_e(cpu)) goto L_ovl02_02C200_0004CF; /* je 0x04CF */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(0x3E7)); /* mov word ss:[bp+-0x48], 0x3E7 */
+L_ovl02_02C200_0004CF:;
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x48] */
+L_ovl02_02C200_0004D2:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x140); /* cmp word ss:[bp+-0x48], 0x140 */
+    if (cc_l(cpu)) goto L_ovl02_02C200_0004DC; /* jl 0x04DC */
+    goto L_ovl02_02C200_000635;              /* jmp 0x0635 */
+L_ovl02_02C200_0004DC:;
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)))); /* sub ax, word ss:[bp+-0x48] */
+    cpu->si = (uint16_t)(cpu->ax);           /* mov si, ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x18);              /* mov ax, 0x18 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->si);                    /* push si */
+    cpu->ax = (uint16_t)(0xB0);              /* mov ax, 0xB0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0BEC(cpu);                      /* call 0000:0BEC */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0xC)); /* add sp, 0xC */
+    cpu->ax = (uint16_t)(0xB0);              /* mov ax, 0xB0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->si);                    /* push si */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    cpu->ax = (uint16_t)(0x18);              /* mov ax, 0x18 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    cpu->ax = (uint16_t)(0x40);              /* mov ax, 0x40 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0xA); /* cmp word ss:[bp+-0x48], 0xA */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_00053C; /* jne 0x053C */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    mem_write16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x10), (uint16_t)(0x5)); /* mov word ds:[bx+0x10], 0x5 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_00053C:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x32); /* cmp word ss:[bp+-0x48], 0x32 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000547; /* jne 0x0547 */
+    mem_write8(cpu, cpu->ds, 0xC936, (uint8_t)(0x0)); /* mov byte ds:[0xC936], 0x0 */
+L_ovl02_02C200_000547:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x46); /* cmp word ss:[bp+-0x48], 0x46 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000558; /* jne 0x0558 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_000558:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x78); /* cmp word ss:[bp+-0x48], 0x78 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000569; /* jne 0x0569 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_000569:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0xA0); /* cmp word ss:[bp+-0x48], 0xA0 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000575; /* jne 0x0575 */
+    mem_write8(cpu, cpu->ds, 0xC936, (uint8_t)(0x0)); /* mov byte ds:[0xC936], 0x0 */
+L_ovl02_02C200_000575:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0xAA); /* cmp word ss:[bp+-0x48], 0xAA */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000587; /* jne 0x0587 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_000587:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0xBE); /* cmp word ss:[bp+-0x48], 0xBE */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000599; /* jne 0x0599 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_000599:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0xD2); /* cmp word ss:[bp+-0x48], 0xD2 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0005AB; /* jne 0x05AB */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_0005AB:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0xE6); /* cmp word ss:[bp+-0x48], 0xE6 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0005BD; /* jne 0x05BD */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_0005BD:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0xFA); /* cmp word ss:[bp+-0x48], 0xFA */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0005CF; /* jne 0x05CF */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_0005CF:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x10E); /* cmp word ss:[bp+-0x48], 0x10E */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0005E1; /* jne 0x05E1 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_0005E1:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x122); /* cmp word ss:[bp+-0x48], 0x122 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0005F3; /* jne 0x05F3 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_0005F3:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x136); /* cmp word ss:[bp+-0x48], 0x136 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000605; /* jne 0x0605 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_000605:;
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_022418(cpu);                         /* call 205A:1E92 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    { uint16_t _r = cpu->ax | cpu->ax; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* or ax, ax */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000618; /* jne 0x0618 */
+    goto L_ovl02_02C200_0003BB;              /* jmp 0x03BB */
+L_ovl02_02C200_000618:;
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, cpu->bx)); /* mov ax, word ds:[bx] */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x44), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x44], ax */
+    mem_write16(cpu, cpu->ds, cpu->bx, (uint16_t)(0x1)); /* mov word ds:[bx], 0x1 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_00062F; /* jne 0x062F */
+    goto L_ovl02_02C200_000352;              /* jmp 0x0352 */
+L_ovl02_02C200_00062F:;
+    cpu->ax = (uint16_t)(0xFC);              /* mov ax, 0xFC */
+    goto L_ovl02_02C200_000355;              /* jmp 0x0355 */
+L_ovl02_02C200_000635:;
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(0x0)); /* mov word ss:[bp+-0x48], 0x0 */
+    goto L_ovl02_02C200_00083B;              /* jmp 0x083B */
+L_ovl02_02C200_00063D:;
+    cpu->ax = (uint16_t)(0x7);               /* mov ax, 0x7 */
+L_ovl02_02C200_000640:;
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xB8);              /* mov ax, 0xB8 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xA0);              /* mov ax, 0xA0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_0018B1(cpu);                         /* call 0181:00B5 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000661; /* je 0x0661 */
+    cpu->ax = (uint16_t)(0xF8);              /* mov ax, 0xF8 */
+    goto L_ovl02_02C200_000664;              /* jmp 0x0664 */
+L_ovl02_02C200_000661:;
+    cpu->ax = (uint16_t)(0xF);               /* mov ax, 0xF */
+L_ovl02_02C200_000664:;
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xB6);              /* mov ax, 0xB6 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xA0);              /* mov ax, 0xA0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_0018B1(cpu);                         /* call 0181:00B5 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000685; /* je 0x0685 */
+    cpu->ax = (uint16_t)(0xFA);              /* mov ax, 0xFA */
+    goto L_ovl02_02C200_000688;              /* jmp 0x0688 */
+L_ovl02_02C200_000685:;
+    cpu->ax = (uint16_t)(0xF);               /* mov ax, 0xF */
+L_ovl02_02C200_000688:;
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xB7);              /* mov ax, 0xB7 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xA0);              /* mov ax, 0xA0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_0018B1(cpu);                         /* call 0181:00B5 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x44))); /* mov ax, word ss:[bp+-0x44] */
+    mem_write16(cpu, cpu->ds, cpu->bx, (uint16_t)(cpu->ax)); /* mov word ds:[bx], ax */
+L_ovl02_02C200_0006A6:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0006BF; /* jne 0x06BF */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, cpu->bx), 0x0); /* cmp word ds:[bx], 0x0 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_0006BA; /* je 0x06BA */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    goto L_ovl02_02C200_0006BD;              /* jmp 0x06BD */
+L_ovl02_02C200_0006BA:;
+    cpu->ax = (uint16_t)(0x3);               /* mov ax, 0x3 */
+L_ovl02_02C200_0006BD:;
+    mem_write16(cpu, cpu->ds, cpu->bx, (uint16_t)(cpu->ax)); /* mov word ds:[bx], ax */
+L_ovl02_02C200_0006BF:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x140); /* cmp word ss:[bp+-0x48], 0x140 */
+    if (cc_ge(cpu)) goto L_ovl02_02C200_0006EE; /* jge 0x06EE */
+    cpu->ax = (uint16_t)(0xC);               /* mov ax, 0xC */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    cpu->ax = (uint16_t)(0x40);              /* mov ax, 0x40 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)))); /* sub ax, word ss:[bp+-0x48] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+L_ovl02_02C200_0006EE:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x0); /* cmp word ss:[bp+-0x48], 0x0 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_00071A; /* je 0x071A */
+    cpu->ax = (uint16_t)(0xC);               /* mov ax, 0xC */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)))); /* sub ax, word ss:[bp+-0x48] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    cpu->ax = (uint16_t)(0x40);              /* mov ax, 0x40 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19E8)); /* push word ds:[0x19E8] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+L_ovl02_02C200_00071A:;
+    cpu->ax = (uint16_t)(0x4C);              /* mov ax, 0x4C */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    cpu->ax = (uint16_t)(0x18);              /* mov ax, 0x18 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xB0);              /* mov ax, 0xB0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x140); /* cmp word ss:[bp+-0x48], 0x140 */
+    if (cc_ge(cpu)) goto L_ovl02_02C200_000770; /* jge 0x0770 */
+    cpu->ax = (uint16_t)(0x64);              /* mov ax, 0x64 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    cpu->ax = (uint16_t)(0x58);              /* mov ax, 0x58 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)))); /* sub ax, word ss:[bp+-0x48] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x58);              /* mov ax, 0x58 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+L_ovl02_02C200_000770:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x0); /* cmp word ss:[bp+-0x48], 0x0 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_00079C; /* je 0x079C */
+    cpu->ax = (uint16_t)(0x64);              /* mov ax, 0x64 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)))); /* sub ax, word ss:[bp+-0x48] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    cpu->ax = (uint16_t)(0x58);              /* mov ax, 0x58 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19E8)); /* push word ds:[0x19E8] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+L_ovl02_02C200_00079C:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0007D0; /* jne 0x07D0 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, cpu->bx)); /* mov ax, word ds:[bx] */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x44), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x44], ax */
+    mem_write16(cpu, cpu->ds, cpu->bx, (uint16_t)(0x0)); /* mov word ds:[bx], 0x0 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->bx);                    /* push bx */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_00102D(cpu);                         /* call 0000:1041 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x44))); /* mov ax, word ss:[bp+-0x44] */
+    mem_write16(cpu, cpu->ds, cpu->bx, (uint16_t)(cpu->ax)); /* mov word ds:[bx], ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0838(cpu);                      /* call 0000:0838 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_0007D0:;
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0A40(cpu);                      /* call 0000:0A40 */
+    cpu->cx = (uint16_t)(cpu->ax);           /* mov cx, ax */
+    cpu->ax = (uint16_t)(0x15);              /* mov ax, 0x15 */
+    { int32_t _r = (int32_t)(int16_t)cpu->ax * (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)); cpu->ax = (uint16_t)_r; cpu->dx = (uint16_t)((uint32_t)_r >> 16); cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | ((uint32_t)_r != (uint32_t)(int32_t)(int16_t)_r ? FLAG_CF|FLAG_OF : 0); } /* imul word ss:[bp+-0x48] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 0x1A40)); /* add ax, 0x1A40 */
+    cpu->bx = (uint16_t)(cpu->cx);           /* mov bx, cx */
+    cpu->dx = (cpu->ax & 0x8000) ? 0xFFFF : 0x0000; /* cwd */
+    { uint16_t _r = cpu->ax ^ cpu->dx; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* xor ax, dx */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->dx)); /* sub ax, dx */
+    cpu->cx = (uint16_t)(0x2);               /* mov cx, 0x2 */
+    { int16_t _v = (int16_t)cpu->ax; uint8_t _c = cpu->cl; int16_t _r = _v >> _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (_c - 1)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, (uint16_t)_r); cpu->ax = (uint16_t)((uint16_t)_r); } /* sar ax, cl */
+    { uint16_t _r = cpu->ax ^ cpu->dx; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* xor ax, dx */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->dx)); /* sub ax, dx */
+    flags_cmp16(cpu, cpu->ax, cpu->bx);      /* cmp ax, bx */
+    if (cc_ge(cpu)) goto L_ovl02_02C200_0007FD; /* jge 0x07FD */
+    flags_logic8(cpu, mem_read8(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)) & 0x1); /* test byte ss:[bp+-0x48], 0x1 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0007FD; /* jne 0x07FD */
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x48] */
+L_ovl02_02C200_0007FD:;
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_205A_2096(cpu);                      /* call 205A:2096 */
+    { uint16_t _r = cpu->ax | cpu->ax; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* or ax, ax */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_00082A; /* jne 0x082A */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0A40(cpu);                      /* call 0000:0A40 */
+    cpu->cx = (uint16_t)(cpu->ax);           /* mov cx, ax */
+    cpu->ax = (uint16_t)(0x15);              /* mov ax, 0x15 */
+    { int32_t _r = (int32_t)(int16_t)cpu->ax * (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)); cpu->ax = (uint16_t)_r; cpu->dx = (uint16_t)((uint32_t)_r >> 16); cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | ((uint32_t)_r != (uint32_t)(int32_t)(int16_t)_r ? FLAG_CF|FLAG_OF : 0); } /* imul word ss:[bp+-0x48] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 0x1A40)); /* add ax, 0x1A40 */
+    cpu->bx = (uint16_t)(cpu->cx);           /* mov bx, cx */
+    cpu->dx = (cpu->ax & 0x8000) ? 0xFFFF : 0x0000; /* cwd */
+    { uint16_t _r = cpu->ax ^ cpu->dx; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* xor ax, dx */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->dx)); /* sub ax, dx */
+    cpu->cx = (uint16_t)(0x2);               /* mov cx, 0x2 */
+    { int16_t _v = (int16_t)cpu->ax; uint8_t _c = cpu->cl; int16_t _r = _v >> _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (_c - 1)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, (uint16_t)_r); cpu->ax = (uint16_t)((uint16_t)_r); } /* sar ax, cl */
+    { uint16_t _r = cpu->ax ^ cpu->dx; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* xor ax, dx */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->dx)); /* sub ax, dx */
+    flags_cmp16(cpu, cpu->ax, cpu->bx);      /* cmp ax, bx */
+    if (cc_g(cpu)) goto L_ovl02_02C200_0007FD; /* jg 0x07FD */
+L_ovl02_02C200_00082A:;
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_205A_2096(cpu);                      /* call 205A:2096 */
+    { uint16_t _r = cpu->ax | cpu->ax; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* or ax, ax */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000838; /* je 0x0838 */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(0x3E7)); /* mov word ss:[bp+-0x48], 0x3E7 */
+L_ovl02_02C200_000838:;
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x48] */
+L_ovl02_02C200_00083B:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x140); /* cmp word ss:[bp+-0x48], 0x140 */
+    if (cc_l(cpu)) goto L_ovl02_02C200_000845; /* jl 0x0845 */
+    goto L_ovl02_02C200_0009D7;              /* jmp 0x09D7 */
+L_ovl02_02C200_000845:;
+    if (cc_ge(cpu)) goto L_ovl02_02C200_000870; /* jge 0x0870 */
+    cpu->ax = (uint16_t)(0xB0);              /* mov ax, 0xB0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    cpu->ax = (uint16_t)(0x18);              /* mov ax, 0x18 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)))); /* sub ax, word ss:[bp+-0x48] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x40);              /* mov ax, 0x40 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+L_ovl02_02C200_000870:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x0); /* cmp word ss:[bp+-0x48], 0x0 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_00089F; /* je 0x089F */
+    cpu->ax = (uint16_t)(0xB0);              /* mov ax, 0xB0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)))); /* sub ax, word ss:[bp+-0x48] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    cpu->ax = (uint16_t)(0x18);              /* mov ax, 0x18 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    cpu->ax = (uint16_t)(0x40);              /* mov ax, 0x40 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19E8)); /* push word ds:[0x19E8] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+L_ovl02_02C200_00089F:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0xA); /* cmp word ss:[bp+-0x48], 0xA */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0008B0; /* jne 0x08B0 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_0008B0:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x1E); /* cmp word ss:[bp+-0x48], 0x1E */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0008C1; /* jne 0x08C1 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_0008C1:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x32); /* cmp word ss:[bp+-0x48], 0x32 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0008CC; /* jne 0x08CC */
+    mem_write8(cpu, cpu->ds, 0xC936, (uint8_t)(0x0)); /* mov byte ds:[0xC936], 0x0 */
+L_ovl02_02C200_0008CC:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x40); /* cmp word ss:[bp+-0x48], 0x40 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0008DD; /* jne 0x08DD */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_0008DD:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x54); /* cmp word ss:[bp+-0x48], 0x54 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0008EE; /* jne 0x08EE */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_0008EE:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x74); /* cmp word ss:[bp+-0x48], 0x74 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0008F9; /* jne 0x08F9 */
+    mem_write8(cpu, cpu->ds, 0xC936, (uint8_t)(0x0)); /* mov byte ds:[0xC936], 0x0 */
+L_ovl02_02C200_0008F9:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x82); /* cmp word ss:[bp+-0x48], 0x82 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_00090B; /* jne 0x090B */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_00090B:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x96); /* cmp word ss:[bp+-0x48], 0x96 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_00091D; /* jne 0x091D */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_00091D:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0xAA); /* cmp word ss:[bp+-0x48], 0xAA */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_00092F; /* jne 0x092F */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_00092F:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0xBE); /* cmp word ss:[bp+-0x48], 0xBE */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000941; /* jne 0x0941 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_000941:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0xD2); /* cmp word ss:[bp+-0x48], 0xD2 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000953; /* jne 0x0953 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_000953:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0xE6); /* cmp word ss:[bp+-0x48], 0xE6 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000965; /* jne 0x0965 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_000965:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0xFA); /* cmp word ss:[bp+-0x48], 0xFA */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000977; /* jne 0x0977 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_000977:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x10E); /* cmp word ss:[bp+-0x48], 0x10E */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_000989; /* jne 0x0989 */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_000989:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x122); /* cmp word ss:[bp+-0x48], 0x122 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_00099B; /* jne 0x099B */
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    ovl02_02DBA3(cpu);                       /* call 0x19A3 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_00099B:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x136); /* cmp word ss:[bp+-0x48], 0x136 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0009A7; /* jne 0x09A7 */
+    mem_write8(cpu, cpu->ds, 0xC936, (uint8_t)(0x0)); /* mov byte ds:[0xC936], 0x0 */
+L_ovl02_02C200_0009A7:;
+    cpu->ax = (uint16_t)(0xC936);            /* mov ax, 0xC936 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_022418(cpu);                         /* call 205A:1E92 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    { uint16_t _r = cpu->ax | cpu->ax; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* or ax, ax */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0009BA; /* jne 0x09BA */
+    goto L_ovl02_02C200_0006A6;              /* jmp 0x06A6 */
+L_ovl02_02C200_0009BA:;
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, cpu->bx)); /* mov ax, word ds:[bx] */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x44), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x44], ax */
+    mem_write16(cpu, cpu->ds, cpu->bx, (uint16_t)(0x1)); /* mov word ds:[bx], 0x1 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_ne(cpu)) goto L_ovl02_02C200_0009D1; /* jne 0x09D1 */
+    goto L_ovl02_02C200_00063D;              /* jmp 0x063D */
+L_ovl02_02C200_0009D1:;
+    cpu->ax = (uint16_t)(0xFC);              /* mov ax, 0xFC */
+    goto L_ovl02_02C200_000640;              /* jmp 0x0640 */
+L_ovl02_02C200_0009D7:;
+    mem_write16(cpu, cpu->ds, 0x6AC2, (uint16_t)(0xFFFE)); /* mov word ds:[0x6AC2], 0xFFFE */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_205A_2096(cpu);                      /* call 205A:2096 */
+    { uint16_t _r = cpu->ax | cpu->ax; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* or ax, ax */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000A0F; /* je 0x0A0F */
+    mem_write16(cpu, cpu->ds, 0x6AC2, (uint16_t)(0xFFFF)); /* mov word ds:[0x6AC2], 0xFFFF */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_1D1F_0AC9(cpu);                      /* call 1D1F:0AC9 */
+    flags_cmp16(cpu, cpu->ax, 0x4E);         /* cmp ax, 0x4E */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000A09; /* je 0x0A09 */
+    if (cc_g(cpu)) goto L_ovl02_02C200_000A3D; /* jg 0x0A3D */
+    flags_cmp16(cpu, cpu->ax, 0x43);         /* cmp ax, 0x43 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000A35; /* je 0x0A35 */
+    flags_cmp16(cpu, cpu->ax, 0x45);         /* cmp ax, 0x45 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000A2D; /* je 0x0A2D */
+    flags_cmp16(cpu, cpu->ax, 0x4C);         /* cmp ax, 0x4C */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000A25; /* je 0x0A25 */
+    goto L_ovl02_02C200_000A0F;              /* jmp 0x0A0F */
+L_ovl02_02C200_000A09:;
+    mem_write16(cpu, cpu->ds, 0x6AC2, (uint16_t)(0x0)); /* mov word ds:[0x6AC2], 0x0 */
+L_ovl02_02C200_000A0F:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0x6AC2), 0xFFFE); /* cmp word ds:[0x6AC2], 0xFFFE */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000A19; /* je 0x0A19 */
+    goto L_ovl02_02C200_000B26;              /* jmp 0x0B26 */
+L_ovl02_02C200_000A19:;
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0A40(cpu);                      /* call 0000:0A40 */
+    flags_cmp16(cpu, cpu->ax, 0xD87);        /* cmp ax, 0xD87 */
+    if (cc_ge(cpu)) goto L_ovl02_02C200_000A53; /* jge 0x0A53 */
+    goto L_ovl02_02C200_000A19;              /* jmp 0x0A19 */
+L_ovl02_02C200_000A25:;
+    mem_write16(cpu, cpu->ds, 0x6AC2, (uint16_t)(0x1)); /* mov word ds:[0x6AC2], 0x1 */
+    goto L_ovl02_02C200_000A0F;              /* jmp 0x0A0F */
+L_ovl02_02C200_000A2D:;
+    mem_write16(cpu, cpu->ds, 0x6AC2, (uint16_t)(0x2)); /* mov word ds:[0x6AC2], 0x2 */
+    goto L_ovl02_02C200_000A0F;              /* jmp 0x0A0F */
+L_ovl02_02C200_000A35:;
+    mem_write16(cpu, cpu->ds, 0x6AC2, (uint16_t)(0x3)); /* mov word ds:[0x6AC2], 0x3 */
+    goto L_ovl02_02C200_000A0F;              /* jmp 0x0A0F */
+L_ovl02_02C200_000A3D:;
+    flags_cmp16(cpu, cpu->ax, 0x63);         /* cmp ax, 0x63 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000A35; /* je 0x0A35 */
+    flags_cmp16(cpu, cpu->ax, 0x65);         /* cmp ax, 0x65 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000A2D; /* je 0x0A2D */
+    flags_cmp16(cpu, cpu->ax, 0x6C);         /* cmp ax, 0x6C */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000A25; /* je 0x0A25 */
+    flags_cmp16(cpu, cpu->ax, 0x6E);         /* cmp ax, 0x6E */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000A09; /* je 0x0A09 */
+    goto L_ovl02_02C200_000A0F;              /* jmp 0x0A0F */
+L_ovl02_02C200_000A53:;
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    cpu->ax = (uint16_t)(0xC8);              /* mov ax, 0xC8 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x4E))); /* push word ss:[bp+-0x4E] */
+    cpu->ax = (uint16_t)(0x40);              /* mov ax, 0x40 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_083F(cpu);                      /* call 0000:083F */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000AB4; /* je 0x0AB4 */
+    cpu->ax = (uint16_t)(0xEF);              /* mov ax, 0xEF */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xE0);              /* mov ax, 0xE0 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xE);               /* mov ax, 0xE */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x4);               /* mov ax, 0x4 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0374(cpu);                      /* call 0000:0374 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    cpu->ax = (uint16_t)(0x4);               /* mov ax, 0x4 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_03EC(cpu);                      /* call 0000:03EC */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+L_ovl02_02C200_000AB4:;
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(0x0)); /* mov word ss:[bp+-0x48], 0x0 */
+L_ovl02_02C200_000AB9:;
+    cpu->ax = (uint16_t)(0x40);              /* mov ax, 0x40 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    cpu->ax = (uint16_t)(0x50);              /* mov ax, 0x50 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x4);               /* mov ax, 0x4 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x40);              /* mov ax, 0x40 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+    cpu->ax = (uint16_t)(0x1);               /* mov ax, 0x1 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_001932(cpu);                         /* call 0181:0136 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x4))); /* add word ss:[bp+-0x48], 0x4 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x140); /* cmp word ss:[bp+-0x48], 0x140 */
+    if (cc_l(cpu)) goto L_ovl02_02C200_000AB9; /* jl 0x0AB9 */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(0x0)); /* mov word ss:[bp+-0x48], 0x0 */
+    goto L_ovl02_02C200_000B0C;              /* jmp 0x0B0C */
+L_ovl02_02C200_000AFD:;
+    cpu->ax = (uint16_t)(0x5);               /* mov ax, 0x5 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    res_001932(cpu);                         /* call 0181:0136 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x48] */
+L_ovl02_02C200_000B0C:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x64); /* cmp word ss:[bp+-0x48], 0x64 */
+    if (cc_ge(cpu)) goto L_ovl02_02C200_000B1B; /* jge 0x0B1B */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_205A_2096(cpu);                      /* call 205A:2096 */
+    { uint16_t _r = cpu->ax | cpu->ax; flags_logic16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* or ax, ax */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000AFD; /* je 0x0AFD */
+L_ovl02_02C200_000B1B:;
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0402_44E9(cpu);                      /* call 0402:44E9 */
+    mem_write16(cpu, cpu->ds, 0x6AC2, (uint16_t)(0xFFFF)); /* mov word ds:[0x6AC2], 0xFFFF */
+L_ovl02_02C200_000B26:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE692), 0x0); /* cmp word ds:[0xE692], 0x0 */
+    if (cc_e(cpu)) goto L_ovl02_02C200_000B4A; /* je 0x0B4A */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(0x1)); /* mov word ss:[bp+-0x48], 0x1 */
+    goto L_ovl02_02C200_000B37;              /* jmp 0x0B37 */
+L_ovl02_02C200_000B34:;
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x48] */
+L_ovl02_02C200_000B37:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48)), 0x4); /* cmp word ss:[bp+-0x48], 0x4 */
+    if (cc_g(cpu)) goto L_ovl02_02C200_000B52; /* jg 0x0B52 */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x48))); /* push word ss:[bp+-0x48] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_041D(cpu);                      /* call 0000:041D */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    goto L_ovl02_02C200_000B34;              /* jmp 0x0B34 */
+L_ovl02_02C200_000B4A:;
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    mem_write16(cpu, cpu->ds, cpu->bx, (uint16_t)(0x0)); /* mov word ds:[bx], 0x0 */
+L_ovl02_02C200_000B52:;
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xC8);              /* mov ax, 0xC8 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0BEC(cpu);                      /* call 0000:0BEC */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0xC)); /* add sp, 0xC */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x4E))); /* push word ss:[bp+-0x4E] */
+    cpu->ax = (uint16_t)(0x40);              /* mov ax, 0x40 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_083F(cpu);                      /* call 0000:083F */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    cpu->ax = (uint16_t)(0x14);              /* mov ax, 0x14 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x1);               /* mov ax, 0x1 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07A7(cpu);                      /* call 0000:07A7 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x4)); /* add sp, 0x4 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    cpu->ax = (uint16_t)(0xC8);              /* mov ax, 0xC8 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x140);             /* mov ax, 0x140 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19D4)); /* push word ds:[0x19D4] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0000:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_0838(cpu);                      /* call 0000:0838 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    mem_write16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x10), (uint16_t)(0x1)); /* mov word ds:[bx+0x10], 0x1 */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x4E))); /* push word ss:[bp+-0x4E] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_1DDE_0523(cpu);                      /* call 1DDE:0523 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    cpu->si = (uint16_t)(pop16(cpu));        /* pop si */
+    cpu->sp = (uint16_t)(cpu->bp);           /* mov sp, bp */
+    cpu->bp = (uint16_t)(pop16(cpu));        /* pop bp */
+    cpu->sp += 4; return;                    /* retf */
 }
 
 /* ─── Random number module (overlay segment 0x1DDE) ─── */
@@ -2508,6 +4275,24 @@ void far_0000_07C3(CPU *cpu)
     cpu->sp += 4; /* far ret */
 }
 
+/* res_01DE5C - integer clamp (lifted from dump @0x1DE5C). FAR function, invoked
+ * via the MSC `push cs; call near` idiom, so args sit at sp+4/+6/+8:
+ *   clamp(value=[sp+4], lo=[sp+6], hi=[sp+8]) -> AX
+ *     if value < lo: value = lo;  if value > hi: value = hi;
+ * far_1DDE_03CE uses it to clamp the title blit's width/height. The previous
+ * no-op stub left AX undefined AND returned as near (sp+=2), which both produced
+ * the degenerate 0x0 blit and corrupted the caller's stack frame. */
+void res_01DE5C(CPU *cpu)
+{
+    int16_t value = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
+    int16_t lo    = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 6));
+    int16_t hi    = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 8));
+    if (value < lo) value = lo;
+    if (value > hi) value = hi;
+    cpu->ax = (uint16_t)value;
+    cpu->sp += 4; /* far ret */
+}
+
 /* far_1B05_17C3 - Map terrain write.
  * Stack: [ret4] [arg1 2] [arg2 2] [arg3 2] [arg4 2]
  * Writes a value to the map at given coordinates and layer. */
@@ -2594,7 +4379,17 @@ static void pic_refill_buffer(CPU *cpu)
     push16(cpu, cpu->dx);
     uint16_t cb_off = mem_read16(cpu, cpu->ds, 0xE84A);
     uint16_t cb_seg = mem_read16(cpu, cpu->ds, 0xE84C);
-    if (cb_seg == 0x1FB6 && cb_off == 0x0642) {
+    /* The refill callback is far_1FB6_0642 (== res_020191), set up by res_02013E
+     * with the relocated segment 0x20B6 (== 0x1FB6+LOAD_SEG) for sp299.pic, or
+     * the unrelocated 0x1FB6 for the title/intro PICs.
+     * NOTE: dispatching the 0x20B6 form for sp299.pic currently spins: the refill
+     * reads DS:0x686C (the token 0xF200) but far_205A_30E4 resolves handle 0
+     * because sp299's file slot is freed while the decoder keeps requesting
+     * refills (sp299 decode does not terminate — a sprite-sheet format issue,
+     * task #4). Until that's fixed, only dispatch the title/intro (0x1FB6) form;
+     * sp299's 0x20B6 falls through to the warning and the game idles at the
+     * post-sp299 screen instead of hanging. */
+    if (cb_off == 0x0642 && cb_seg == 0x1FB6) {
         push16(cpu, cpu->cs); push16(cpu, 0);
         res_020191(cpu);
     } else {
@@ -2864,4 +4659,565 @@ void res_001284(CPU *cpu)
     }
 
     cpu->sp += 2; /* near ret */
+}
+
+/* ─── Resident PIC decoder aliases (the dump-lifted copy the runtime actually
+ * calls via far_0000_11FA / far_0000_1080) ───
+ * The resident and overlay copies of the LZW+RLE PIC decoder were lifted at a
+ * +0x14 offset, so the resident entry points (res_001219/1262/1298/130A) got
+ * separate STUBS while the working implementations live under the overlay names
+ * (res_001205/124E/1284/12F6). Both copies share the SAME DGROUP state (dict
+ * @DS:0xC936, bit buffer @0x6886, decode stack @0x687A, counts @0x6874..0x688C),
+ * so delegating the resident entries to the implemented twins decodes correctly.
+ * Verified res_001219's disasm matches res_001205 exactly (guard -> RLE state ->
+ * stack base 0x6A8D -> max-width read -> dict init). This was why every PIC
+ * (logo/birth/title) opened+read but produced no pixels (screen stayed blank). */
+void res_001219(CPU *cpu) { res_001205(cpu); }  /* LZW state init */
+void res_001262(CPU *cpu) { res_00124E(cpu); }  /* dict reset */
+void res_001298(CPU *cpu) { res_001284(cpu); }  /* RLE+LZW row decode */
+void res_00130A(CPU *cpu) { res_0012F6(cpu); }  /* LZW next byte */
+
+/* res_01D665 - menu accelerator-table builder (lifted). Called by res_01D221
+ * to parse the menu string and fill the per-item accel table at DS:0xEB7A so
+ * first-letter select works (was a no-op stub -> empty table -> menu spun).
+ * Cosmetic menu-box draws (far_0181_*) stay no-op stubs. */
+void far_0181_002C(CPU *cpu) { cpu->sp += 4; }
+void res_01DB5C(CPU *cpu) { cpu->sp += 2; }
+void res_01D665(CPU *cpu);
+void res_01DB5C(CPU *cpu);
+void res_01DBF5(CPU *cpu);
+
+/* Function: res_01D665
+ * Dump offset: 0x01D665 - 0x01DB5C (1271 bytes)
+ */
+void res_01D665(CPU *cpu)
+{
+    push16(cpu, cpu->bp);                    /* push bp */
+    cpu->bp = (uint16_t)(cpu->sp);           /* mov bp, sp */
+    cpu->sp = (uint16_t)(flags_sub16(cpu, cpu->sp, 0x5C)); /* sub sp, 0x5C */
+    push16(cpu, cpu->di);                    /* push di */
+    push16(cpu, cpu->si);                    /* push si */
+    mem_write16(cpu, cpu->ds, 0x64E0, (uint16_t)(0x0)); /* mov word ds:[0x64E0], 0x0 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE212), 0x1); /* cmp word ds:[0xE212], 0x1 */
+    if (cc_e(cpu)) goto L_res_01D665_000018; /* je 0x0018 */
+    goto L_res_01D665_00036A;                /* jmp 0x036A */
+L_res_01D665_000018:;
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    push16(cpu, mem_read16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x10))); /* push word ds:[bx+0x10] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07B5(cpu);                      /* call 0100:07B5 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    mem_write16(cpu, cpu->ds, 0x2F54, (uint16_t)(cpu->ax)); /* mov word ds:[0x2F54], ax */
+    flags_cmp16(cpu, cpu->ax, 0x9);          /* cmp ax, 0x9 */
+    if (cc_ne(cpu)) goto L_res_01D665_000033; /* jne 0x0033 */
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ds, 0x2F54, (uint16_t)(flags_sub16(cpu, mem_read16(cpu, cpu->ds, 0x2F54), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* dec word ds:[0x2F54] */
+L_res_01D665_000033:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0x38E6), 0xFFFF); /* cmp word ds:[0x38E6], 0xFFFF */
+    if (cc_e(cpu)) goto L_res_01D665_000040; /* je 0x0040 */
+    mem_write16(cpu, cpu->ds, 0x2F54, (uint16_t)(0x8)); /* mov word ds:[0x2F54], 0x8 */
+L_res_01D665_000040:;
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56), (uint16_t)(0x0)); /* mov word ss:[bp+-0x56], 0x0 */
+L_res_01D665_000045:;
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* mov bx, word ss:[bp+-0x56] */
+    mem_write8(cpu, cpu->ds, (uint16_t)(cpu->bx - 0x1486), (uint8_t)(0xFF)); /* mov byte ds:[bx+-0x1486], 0xFF */
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x56] */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56)), 0x20); /* cmp word ss:[bp+-0x56], 0x20 */
+    if (cc_l(cpu)) goto L_res_01D665_000045; /* jl 0x0045 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x5A], ax */
+    mem_write16(cpu, cpu->ds, 0x6520, (uint16_t)(cpu->ax)); /* mov word ds:[0x6520], ax */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x54), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x54], ax */
+    mem_write16(cpu, cpu->ds, 0xE3F8, (uint16_t)(cpu->ax)); /* mov word ds:[0xE3F8], ax */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x56], ax */
+    goto L_res_01D665_0000C6;                /* jmp 0x00C6 */
+L_res_01D665_000069:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x54)), 0x0); /* cmp word ss:[bp+-0x54], 0x0 */
+    if (cc_ne(cpu)) goto L_res_01D665_0000A7; /* jne 0x00A7 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* mov bx, word ss:[bp+-0x56] */
+    cpu->si = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6))); /* mov si, word ss:[bp+0x6] */
+    cpu->al = (uint8_t)(mem_read8(cpu, cpu->ds, (uint16_t)(cpu->bx + cpu->si))); /* mov al, byte ds:[bx+si] */
+    mem_write8(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5C), (uint8_t)(cpu->al)); /* mov byte ss:[bp+-0x5C], al */
+    flags_cmp8(cpu, cpu->al, 0x20);          /* cmp al, 0x20 */
+    if (cc_e(cpu)) goto L_res_01D665_000082; /* je 0x0082 */
+    flags_cmp8(cpu, cpu->al, 0x5F);          /* cmp al, 0x5F */
+    if (cc_ne(cpu)) goto L_res_01D665_0000A7; /* jne 0x00A7 */
+L_res_01D665_000082:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A)), 0x20); /* cmp word ss:[bp+-0x5A], 0x20 */
+    if (cc_ge(cpu)) goto L_res_01D665_000097; /* jge 0x0097 */
+    cpu->si = (uint16_t)(cpu->bx);           /* mov si, bx */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6))); /* mov bx, word ss:[bp+0x6] */
+    cpu->al = (uint8_t)(mem_read8(cpu, cpu->ds, (uint16_t)(cpu->bx + cpu->si + 0x1))); /* mov al, byte ds:[bx+si+0x1] */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A))); /* mov bx, word ss:[bp+-0x5A] */
+    mem_write8(cpu, cpu->ds, (uint16_t)(cpu->bx - 0x1486), (uint8_t)(cpu->al)); /* mov byte ds:[bx+-0x1486], al */
+L_res_01D665_000097:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xC11C), 0xFFFF); /* cmp word ds:[0xC11C], 0xFFFF */
+    if (cc_ne(cpu)) goto L_res_01D665_0000A4; /* jne 0x00A4 */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, 0x6520)); /* mov ax, word ds:[0x6520] */
+    mem_write16(cpu, cpu->ds, 0xC11C, (uint16_t)(cpu->ax)); /* mov word ds:[0xC11C], ax */
+L_res_01D665_0000A4:;
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x5A] */
+L_res_01D665_0000A7:;
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* mov bx, word ss:[bp+-0x56] */
+    cpu->si = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6))); /* mov si, word ss:[bp+0x6] */
+    cpu->al = (uint8_t)(mem_read8(cpu, cpu->ds, (uint16_t)(cpu->bx + cpu->si))); /* mov al, byte ds:[bx+si] */
+    cpu->ax = (uint16_t)(int16_t)(int8_t)cpu->al; /* cbw */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    push16(cpu, mem_read16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x10))); /* push word ds:[bx+0x10] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_077D(cpu);                      /* call 0100:077D */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x4)); /* add sp, 0x4 */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x54), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x54)), cpu->ax))); /* add word ss:[bp+-0x54], ax */
+L_res_01D665_0000C3:;
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x56] */
+L_res_01D665_0000C6:;
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6))); /* push word ss:[bp+0x6] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_205A_1E92(cpu);                      /* call 215A:1E92 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    flags_cmp16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* cmp ax, word ss:[bp+-0x56] */
+    if (cc_le(cpu)) goto L_res_01D665_000108; /* jle 0x0108 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* mov bx, word ss:[bp+-0x56] */
+    cpu->si = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6))); /* mov si, word ss:[bp+0x6] */
+    flags_cmp8(cpu, mem_read8(cpu, cpu->ds, (uint16_t)(cpu->bx + cpu->si)), 0xA); /* cmp byte ds:[bx+si], 0xA */
+    if (cc_ne(cpu)) goto L_res_01D665_000069; /* jne 0x0069 */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, 0xE3F8)); /* mov ax, word ds:[0xE3F8] */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x54)), cpu->ax); /* cmp word ss:[bp+-0x54], ax */
+    if (cc_le(cpu)) goto L_res_01D665_0000EF; /* jle 0x00EF */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x54))); /* mov ax, word ss:[bp+-0x54] */
+    mem_write16(cpu, cpu->ds, 0xE3F8, (uint16_t)(cpu->ax)); /* mov word ds:[0xE3F8], ax */
+L_res_01D665_0000EF:;
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x54), (uint16_t)(0x0)); /* mov word ss:[bp+-0x54], 0x0 */
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ds, 0x6520, (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ds, 0x6520), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ds:[0x6520] */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0x6520)); /* mov bx, word ds:[0x6520] */
+    { uint16_t _v = cpu->bx; uint8_t _c = 0x1; uint16_t _r = _v << _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (16 - _c)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, _r); cpu->bx = (uint16_t)(_r); } /* shl bx, 0x1 */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* mov ax, word ss:[bp+-0x56] */
+    { int _cf = cf(cpu); cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 1)); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc ax */
+    mem_write16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x64E0), (uint16_t)(cpu->ax)); /* mov word ds:[bx+0x64E0], ax */
+    goto L_res_01D665_0000C3;                /* jmp 0x00C3 */
+L_res_01D665_000108:;
+    cpu->ax = (uint16_t)(0xC0);              /* mov ax, 0xC0 */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xA)))); /* sub ax, word ss:[bp+0xA] */
+    cpu->dx = (cpu->ax & 0x8000) ? 0xFFFF : 0x0000; /* cwd */
+    cpu->cx = (uint16_t)(mem_read16(cpu, cpu->ds, 0x2F54)); /* mov cx, word ds:[0x2F54] */
+    { int32_t _n = (int32_t)(((uint32_t)cpu->dx << 16) | cpu->ax); int16_t _d = (int16_t)cpu->cx; cpu->ax = (uint16_t)(int16_t)(_n / _d); cpu->dx = (uint16_t)(int16_t)(_n % _d); } /* idiv cx */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x6520)); /* push word ds:[0x6520] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_1DDE_007C(cpu);                      /* call 1EDE:007C */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x6)); /* add sp, 0x6 */
+    mem_write16(cpu, cpu->ds, 0x6520, (uint16_t)(cpu->ax)); /* mov word ds:[0x6520], ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x8))); /* mov ax, word ss:[bp+0x8] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, mem_read16(cpu, cpu->ds, 0xE3F8))); /* add ax, word ds:[0xE3F8] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 0x8)); /* add ax, 0x8 */
+    mem_write16(cpu, cpu->ds, 0xED3E, (uint16_t)(cpu->ax)); /* mov word ds:[0xED3E], ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, 0x6520)); /* mov ax, word ds:[0x6520] */
+    { int32_t _r = (int32_t)(int16_t)cpu->ax * (int16_t)mem_read16(cpu, cpu->ds, 0x2F54); cpu->ax = (uint16_t)_r; cpu->dx = (uint16_t)((uint32_t)_r >> 16); cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | ((uint32_t)_r != (uint32_t)(int32_t)(int16_t)_r ? FLAG_CF|FLAG_OF : 0); } /* imul word ds:[0x2F54] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xA)))); /* add ax, word ss:[bp+0xA] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 0x6)); /* add ax, 0x6 */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x52), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x52], ax */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0x2F50), 0x0); /* cmp word ds:[0x2F50], 0x0 */
+    if (cc_e(cpu)) goto L_res_01D665_000150; /* je 0x0150 */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x52), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x52)), 0x2))); /* add word ss:[bp+-0x52], 0x2 */
+L_res_01D665_000150:;
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6))); /* push word ss:[bp+0x6] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_205A_1E92(cpu);                      /* call 215A:1E92 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    cpu->si = (uint16_t)(cpu->ax);           /* mov si, ax */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6))); /* mov bx, word ss:[bp+0x6] */
+    flags_cmp8(cpu, mem_read8(cpu, cpu->ds, (uint16_t)(cpu->bx + cpu->si - 0x1)), 0xA); /* cmp byte ds:[bx+si+-0x1], 0xA */
+    if (cc_e(cpu)) goto L_res_01D665_000169; /* je 0x0169 */
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A), (uint16_t)(flags_sub16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* dec word ss:[bp+-0x5A] */
+L_res_01D665_000169:;
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A))); /* mov ax, word ss:[bp+-0x5A] */
+    mem_write16(cpu, cpu->ds, 0xE138, (uint16_t)(cpu->ax)); /* mov word ds:[0xE138], ax */
+    flags_logic8(cpu, mem_read8(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xA)) & 0x1); /* test byte ss:[bp+0xA], 0x1 */
+    if (cc_e(cpu)) goto L_res_01D665_000178; /* je 0x0178 */
+    goto L_res_01D665_0002E6;                /* jmp 0x02E6 */
+L_res_01D665_000178:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0x2F4E), 0xFFFF); /* cmp word ds:[0x2F4E], 0xFFFF */
+    if (cc_ne(cpu)) goto L_res_01D665_00019E; /* jne 0x019E */
+    cpu->ax = (uint16_t)(0x7);               /* mov ax, 0x7 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x52))); /* mov ax, word ss:[bp+-0x52] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xA)))); /* sub ax, word ss:[bp+0xA] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, 0xED3E)); /* mov ax, word ds:[0xED3E] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x8)))); /* sub ax, word ss:[bp+0x8] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xA))); /* push word ss:[bp+0xA] */
+    push16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x8))); /* push word ss:[bp+0x8] */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    res_01DB5C(cpu);                         /* call 0x04F7 */
+    goto L_res_01D665_0002E3;                /* jmp 0x02E3 */
+L_res_01D665_00019E:;
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0x2F4E)); /* mov bx, word ds:[0x2F4E] */
+    { uint16_t _v = cpu->bx; uint8_t _c = 0x1; uint16_t _r = _v << _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (16 - _c)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, _r); cpu->bx = (uint16_t)(_r); } /* shl bx, 0x1 */
+    push16(cpu, mem_read16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x2F56))); /* push word ds:[bx+0x2F56] */
+    cpu->ax = (uint16_t)((uint16_t)(cpu->bp - 0x50)); /* lea ax, word ss:[bp+-0x50] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_205A_1E60(cpu);                      /* call 215A:1E60 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x4)); /* add sp, 0x4 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0x2F4E), 0x2); /* cmp word ds:[0x2F4E], 0x2 */
+    if (cc_g(cpu)) goto L_res_01D665_0001CB; /* jg 0x01CB */
+    cpu->ax = (uint16_t)(0x2F64);            /* mov ax, 0x2F64 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)((uint16_t)(cpu->bp - 0x50)); /* lea ax, word ss:[bp+-0x50] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_205A_1E20(cpu);                      /* call 215A:1E20 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x4)); /* add sp, 0x4 */
+L_res_01D665_0001CB:;
+    cpu->ax = (uint16_t)((uint16_t)(cpu->bp - 0x50)); /* lea ax, word ss:[bp+-0x50] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0181_00F1(cpu);                      /* call 0281:00F1 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x58), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x58], ax */
+    cpu->si = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x8))); /* mov si, word ss:[bp+0x8] */
+    cpu->si = (uint16_t)(flags_add16(cpu, cpu->si, cpu->ax)); /* add si, ax */
+    cpu->si = (uint16_t)(flags_add16(cpu, cpu->si, 0x8)); /* add si, 0x8 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xED3E), cpu->si); /* cmp word ds:[0xED3E], si */
+    if (cc_ge(cpu)) goto L_res_01D665_0001EC; /* jge 0x01EC */
+    mem_write16(cpu, cpu->ds, 0xED3E, (uint16_t)(cpu->si)); /* mov word ds:[0xED3E], si */
+L_res_01D665_0001EC:;
+    cpu->si = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x52))); /* mov si, word ss:[bp+-0x52] */
+    cpu->si = (uint16_t)(flags_sub16(cpu, cpu->si, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xA)))); /* sub si, word ss:[bp+0xA] */
+    cpu->ax = (uint16_t)(0x7);               /* mov ax, 0x7 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x3E7);             /* mov ax, 0x3E7 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x3D);              /* mov ax, 0x3D */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)((uint16_t)(cpu->si + 0x8)); /* lea ax, word ds:[si+0x8] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_1DDE_007C(cpu);                      /* call 1EDE:007C */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x6)); /* add sp, 0x6 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, 0xED3E)); /* mov ax, word ds:[0xED3E] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x8)))); /* sub ax, word ss:[bp+0x8] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 0x2A)); /* add ax, 0x2A */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xA))); /* mov ax, word ss:[bp+0xA] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 0x8)); /* sub ax, 0x8 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x8))); /* mov ax, word ss:[bp+0x8] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 0x2A)); /* sub ax, 0x2A */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    res_01DB5C(cpu);                         /* call 0x04F7 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0xA)); /* add sp, 0xA */
+    cpu->ax = (uint16_t)((uint16_t)(cpu->si - 0x34)); /* lea ax, word ds:[si+-0x34] */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x58), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x58], ax */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0x2F4E), 0x2); /* cmp word ds:[0x2F4E], 0x2 */
+    if (cc_g(cpu)) goto L_res_01D665_00025D; /* jg 0x025D */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0x2F4E)); /* mov bx, word ds:[0x2F4E] */
+    { uint16_t _v = cpu->bx; uint8_t _c = 0x1; uint16_t _r = _v << _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (16 - _c)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, _r); cpu->bx = (uint16_t)(_r); } /* shl bx, 0x1 */
+    push16(cpu, mem_read16(cpu, cpu->ds, (uint16_t)(cpu->bx - 0x116E))); /* push word ds:[bx+-0x116E] */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xA))); /* mov ax, word ss:[bp+0xA] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 0x5)); /* sub ax, 0x5 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x8))); /* mov ax, word ss:[bp+0x8] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 0x28)); /* sub ax, 0x28 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_083F(cpu);                      /* call 0100:083F */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    goto L_res_01D665_0002A0;                /* jmp 0x02A0 */
+L_res_01D665_00025D:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x58)), 0x0); /* cmp word ss:[bp+-0x58], 0x0 */
+    if (cc_le(cpu)) goto L_res_01D665_000269; /* jle 0x0269 */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x58))); /* mov ax, word ss:[bp+-0x58] */
+    { int _cf = cf(cpu); cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 1)); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* dec ax */
+    goto L_res_01D665_00026B;                /* jmp 0x026B */
+L_res_01D665_000269:;
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+L_res_01D665_00026B:;
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xA)))); /* add ax, word ss:[bp+0xA] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 0x6)); /* sub ax, 0x6 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x8))); /* mov ax, word ss:[bp+0x8] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 0x28)); /* sub ax, 0x28 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0xAA)); /* push word ds:[0xAA] */
+    cpu->ax = (uint16_t)(0x3C);              /* mov ax, 0x3C */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x28);              /* mov ax, 0x28 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x8C);              /* mov ax, 0x8C */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x28);              /* mov ax, 0x28 */
+    { int32_t _r = (int32_t)(int16_t)cpu->ax * (int16_t)mem_read16(cpu, cpu->ds, 0x2F4E); cpu->ax = (uint16_t)_r; cpu->dx = (uint16_t)((uint32_t)_r >> 16); cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | ((uint32_t)_r != (uint32_t)(int32_t)(int16_t)_r ? FLAG_CF|FLAG_OF : 0); } /* imul word ds:[0x2F4E] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 0x28)); /* add ax, 0x28 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, mem_read16(cpu, cpu->ds, 0x19E8)); /* push word ds:[0x19E8] */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0000_07ED(cpu);                      /* call 0100:07ED */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x10)); /* add sp, 0x10 */
+L_res_01D665_0002A0:;
+    cpu->si = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x8))); /* mov si, word ss:[bp+0x8] */
+    cpu->si = (uint16_t)(flags_add16(cpu, cpu->si, 0x5)); /* add si, 0x5 */
+    cpu->ax = (uint16_t)(0xF);               /* mov ax, 0xF */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xA))); /* mov ax, word ss:[bp+0xA] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 0x4)); /* sub ax, 0x4 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->si);                    /* push si */
+    cpu->ax = (uint16_t)((uint16_t)(cpu->bp - 0x50)); /* lea ax, word ss:[bp+-0x50] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0181_005E(cpu);                      /* call 0281:005E */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    cpu->di = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xA))); /* mov di, word ss:[bp+0xA] */
+    cpu->di = (uint16_t)(flags_add16(cpu, cpu->di, 0x3)); /* add di, 0x3 */
+    cpu->ax = (uint16_t)(0xB);               /* mov ax, 0xB */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->di);                    /* push di */
+    cpu->ax = (uint16_t)((uint16_t)(cpu->bp - 0x50)); /* lea ax, word ss:[bp+-0x50] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0181_00F1(cpu);                      /* call 0281:00F1 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x8)))); /* add ax, word ss:[bp+0x8] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 0x5)); /* add ax, 0x5 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->di);                    /* push di */
+    push16(cpu, cpu->si);                    /* push si */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0181_000C(cpu);                      /* call 0281:000C */
+L_res_01D665_0002E3:;
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0xA)); /* add sp, 0xA */
+L_res_01D665_0002E6:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0x2F50), 0x0); /* cmp word ds:[0x2F50], 0x0 */
+    if (cc_e(cpu)) goto L_res_01D665_000324; /* je 0x0324 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x10))); /* mov ax, word ds:[bx+0x10] */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x56], ax */
+    mem_write16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x10), (uint16_t)(0x2)); /* mov word ds:[bx+0x10], 0x2 */
+    cpu->ax = (uint16_t)(0xA);               /* mov ax, 0xA */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x52))); /* mov ax, word ss:[bp+-0x52] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 0x4)); /* sub ax, 0x4 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, 0xED3E)); /* mov ax, word ds:[0xED3E] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 0x4A)); /* sub ax, 0x4A */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x2F6D);            /* mov ax, 0x2F6D */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0181_005E(cpu);                      /* call 0281:005E */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* mov ax, word ss:[bp+-0x56] */
+    mem_write16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x10), (uint16_t)(cpu->ax)); /* mov word ds:[bx+0x10], ax */
+L_res_01D665_000324:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0x7FF6), 0x0); /* cmp word ds:[0x7FF6], 0x0 */
+    if (cc_e(cpu)) goto L_res_01D665_00036A; /* je 0x036A */
+    cpu->ax = (uint16_t)(0xB);               /* mov ax, 0xB */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x52))); /* mov ax, word ss:[bp+-0x52] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 0x8)); /* sub ax, 0x8 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, 0xED3E)); /* mov ax, word ds:[0xED3E] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 0x11)); /* sub ax, 0x11 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x2F7E);            /* mov ax, 0x2F7E */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0181_002C(cpu);                      /* call 0281:002C */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    cpu->ax = (uint16_t)(0xB);               /* mov ax, 0xB */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0xA);               /* mov ax, 0xA */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(0x14);              /* mov ax, 0x14 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x52))); /* mov ax, word ss:[bp+-0x52] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 0xA)); /* sub ax, 0xA */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, 0xED3E)); /* mov ax, word ds:[0xED3E] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, 0x14)); /* sub ax, 0x14 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs);                    /* push cs */
+    push16(cpu, 0);                          /* near call return addr */
+    res_01DBF5(cpu);                         /* call 0x0590 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0xA)); /* add sp, 0xA */
+L_res_01D665_00036A:;
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6))); /* mov bx, word ss:[bp+0x6] */
+    flags_cmp8(cpu, mem_read8(cpu, cpu->ds, cpu->bx), 0x20); /* cmp byte ds:[bx], 0x20 */
+    if (cc_e(cpu)) goto L_res_01D665_000377; /* je 0x0377 */
+    flags_cmp8(cpu, mem_read8(cpu, cpu->ds, cpu->bx), 0x5F); /* cmp byte ds:[bx], 0x5F */
+    if (cc_ne(cpu)) goto L_res_01D665_00037B; /* jne 0x037B */
+L_res_01D665_000377:;
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    goto L_res_01D665_00037E;                /* jmp 0x037E */
+L_res_01D665_00037B:;
+    cpu->ax = (uint16_t)(0xFFFF);            /* mov ax, 0xFFFF */
+L_res_01D665_00037E:;
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A), (uint16_t)(cpu->ax)); /* mov word ss:[bp+-0x5A], ax */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0xAA)); /* mov bx, word ds:[0xAA] */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, 0x64DE)); /* mov ax, word ds:[0x64DE] */
+    mem_write16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0xC), (uint16_t)(cpu->ax)); /* mov word ds:[bx+0xC], ax */
+    mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56), (uint16_t)(0x0)); /* mov word ss:[bp+-0x56], 0x0 */
+    goto L_res_01D665_000488;                /* jmp 0x0488 */
+L_res_01D665_000393:;
+    cpu->ax = (uint16_t)(0x1);               /* mov ax, 0x1 */
+    cpu->cl = (uint8_t)(mem_read8(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A))); /* mov cl, byte ss:[bp+-0x5A] */
+    { uint16_t _v = cpu->ax; uint8_t _c = cpu->cl; uint16_t _r = _v << _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (16 - _c)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* shl ax, cl */
+    flags_logic16(cpu, mem_read16(cpu, cpu->ds, 0xC1A6) & cpu->ax); /* test word ds:[0xC1A6], ax */
+    if (cc_e(cpu)) goto L_res_01D665_0003A6; /* je 0x03A6 */
+    cpu->ax = (uint16_t)(0x3);               /* mov ax, 0x3 */
+    goto L_res_01D665_0003A8;                /* jmp 0x03A8 */
+L_res_01D665_0003A6:;
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+L_res_01D665_0003A8:;
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* mov ax, word ss:[bp+-0x56] */
+    { int32_t _r = (int32_t)(int16_t)cpu->ax * (int16_t)mem_read16(cpu, cpu->ds, 0x2F54); cpu->ax = (uint16_t)_r; cpu->dx = (uint16_t)((uint32_t)_r >> 16); cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | ((uint32_t)_r != (uint32_t)(int32_t)(int16_t)_r ? FLAG_CF|FLAG_OF : 0); } /* imul word ds:[0x2F54] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xA)))); /* add ax, word ss:[bp+0xA] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 0x5)); /* add ax, 0x5 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x8))); /* mov ax, word ss:[bp+0x8] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 0x5)); /* add ax, 0x5 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->di);                    /* push di */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0181_005E(cpu);                      /* call 0281:005E */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, (uint16_t)(cpu->si + 0x64E0))); /* mov bx, word ds:[si+0x64E0] */
+    cpu->bx = (uint16_t)(flags_add16(cpu, cpu->bx, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6)))); /* add bx, word ss:[bp+0x6] */
+    mem_write8(cpu, cpu->ds, cpu->bx, (uint8_t)(0x20)); /* mov byte ds:[bx], 0x20 */
+    goto L_res_01D665_000459;                /* jmp 0x0459 */
+L_res_01D665_0003D4:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A)), 0x0); /* cmp word ss:[bp+-0x5A], 0x0 */
+    if (cc_ge(cpu)) goto L_res_01D665_00040E; /* jge 0x040E */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0x2F54), 0x9); /* cmp word ds:[0x2F54], 0x9 */
+    if (cc_le(cpu)) goto L_res_01D665_00040E; /* jle 0x040E */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* mov ax, word ss:[bp+-0x56] */
+    { int32_t _r = (int32_t)(int16_t)cpu->ax * (int16_t)mem_read16(cpu, cpu->ds, 0x2F54); cpu->ax = (uint16_t)_r; cpu->dx = (uint16_t)((uint32_t)_r >> 16); cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | ((uint32_t)_r != (uint32_t)(int32_t)(int16_t)_r ? FLAG_CF|FLAG_OF : 0); } /* imul word ds:[0x2F54] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xA)))); /* add ax, word ss:[bp+0xA] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 0x6)); /* add ax, 0x6 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x8))); /* mov ax, word ss:[bp+0x8] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 0x5)); /* add ax, 0x5 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* mov bx, word ss:[bp+-0x56] */
+    { uint16_t _v = cpu->bx; uint8_t _c = 0x1; uint16_t _r = _v << _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (16 - _c)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, _r); cpu->bx = (uint16_t)(_r); } /* shl bx, 0x1 */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x64E0))); /* mov ax, word ds:[bx+0x64E0] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6)))); /* add ax, word ss:[bp+0x6] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0181_005E(cpu);                      /* call 0281:005E */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+L_res_01D665_00040E:;
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A)), 0x0); /* cmp word ss:[bp+-0x5A], 0x0 */
+    if (cc_ge(cpu)) goto L_res_01D665_000419; /* jge 0x0419 */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, 0x64DE)); /* mov ax, word ds:[0x64DE] */
+    goto L_res_01D665_00042E;                /* jmp 0x042E */
+L_res_01D665_000419:;
+    cpu->ax = (uint16_t)(0x1);               /* mov ax, 0x1 */
+    cpu->cl = (uint8_t)(mem_read8(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A))); /* mov cl, byte ss:[bp+-0x5A] */
+    { uint16_t _v = cpu->ax; uint8_t _c = cpu->cl; uint16_t _r = _v << _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (16 - _c)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* shl ax, cl */
+    flags_logic16(cpu, mem_read16(cpu, cpu->ds, 0xC1A6) & cpu->ax); /* test word ds:[0xC1A6], ax */
+    if (cc_e(cpu)) goto L_res_01D665_00042C; /* je 0x042C */
+    cpu->ax = (uint16_t)(0x3);               /* mov ax, 0x3 */
+    goto L_res_01D665_00042E;                /* jmp 0x042E */
+L_res_01D665_00042C:;
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, cpu->ax)); /* sub ax, ax */
+L_res_01D665_00042E:;
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* mov ax, word ss:[bp+-0x56] */
+    { int32_t _r = (int32_t)(int16_t)cpu->ax * (int16_t)mem_read16(cpu, cpu->ds, 0x2F54); cpu->ax = (uint16_t)_r; cpu->dx = (uint16_t)((uint32_t)_r >> 16); cpu->flags = (cpu->flags & ~(FLAG_CF|FLAG_OF)) | ((uint32_t)_r != (uint32_t)(int32_t)(int16_t)_r ? FLAG_CF|FLAG_OF : 0); } /* imul word ds:[0x2F54] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xA)))); /* add ax, word ss:[bp+0xA] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 0x5)); /* add ax, 0x5 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x8))); /* mov ax, word ss:[bp+0x8] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, 0x5)); /* add ax, 0x5 */
+    push16(cpu, cpu->ax);                    /* push ax */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* mov bx, word ss:[bp+-0x56] */
+    { uint16_t _v = cpu->bx; uint8_t _c = 0x1; uint16_t _r = _v << _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (16 - _c)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, _r); cpu->bx = (uint16_t)(_r); } /* shl bx, 0x1 */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x64E0))); /* mov ax, word ds:[bx+0x64E0] */
+    cpu->ax = (uint16_t)(flags_add16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6)))); /* add ax, word ss:[bp+0x6] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_0181_005E(cpu);                      /* call 0281:005E */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x8)); /* add sp, 0x8 */
+L_res_01D665_000459:;
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* mov bx, word ss:[bp+-0x56] */
+    { uint16_t _v = cpu->bx; uint8_t _c = 0x1; uint16_t _r = _v << _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (16 - _c)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, _r); cpu->bx = (uint16_t)(_r); } /* shl bx, 0x1 */
+    cpu->si = (uint16_t)(mem_read16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x64E2))); /* mov si, word ds:[bx+0x64E2] */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6))); /* mov bx, word ss:[bp+0x6] */
+    mem_write8(cpu, cpu->ds, (uint16_t)(cpu->bx + cpu->si - 0x1), (uint8_t)(0xA)); /* mov byte ds:[bx+si+-0x1], 0xA */
+L_res_01D665_000469:;
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* mov bx, word ss:[bp+-0x56] */
+    { uint16_t _v = cpu->bx; uint8_t _c = 0x1; uint16_t _r = _v << _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (16 - _c)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, _r); cpu->bx = (uint16_t)(_r); } /* shl bx, 0x1 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, (uint16_t)(cpu->bx + 0x64E2))); /* mov bx, word ds:[bx+0x64E2] */
+    cpu->si = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6))); /* mov si, word ss:[bp+0x6] */
+    cpu->al = (uint8_t)(mem_read8(cpu, cpu->ds, (uint16_t)(cpu->bx + cpu->si))); /* mov al, byte ds:[bx+si] */
+    mem_write8(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5C), (uint8_t)(cpu->al)); /* mov byte ss:[bp+-0x5C], al */
+    flags_cmp8(cpu, cpu->al, 0x20);          /* cmp al, 0x20 */
+    if (cc_e(cpu)) goto L_res_01D665_000482; /* je 0x0482 */
+    flags_cmp8(cpu, cpu->al, 0x5F);          /* cmp al, 0x5F */
+    if (cc_ne(cpu)) goto L_res_01D665_000485; /* jne 0x0485 */
+L_res_01D665_000482:;
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x5A] */
+L_res_01D665_000485:;
+    { int _cf = cf(cpu); mem_write16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56), (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56)), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; } /* inc word ss:[bp+-0x56] */
+L_res_01D665_000488:;
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, 0x6520)); /* mov ax, word ds:[0x6520] */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56)), cpu->ax); /* cmp word ss:[bp+-0x56], ax */
+    if (cc_ge(cpu)) goto L_res_01D665_0004EE; /* jge 0x04EE */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0xE212), 0x0); /* cmp word ds:[0xE212], 0x0 */
+    if (cc_ne(cpu)) goto L_res_01D665_0004AB; /* jne 0x04AB */
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xC))); /* mov ax, word ss:[bp+0xC] */
+    cpu->ax = (uint16_t)(flags_sub16(cpu, cpu->ax, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A)))); /* sub ax, word ss:[bp+-0x5A] */
+    push16(cpu, cpu->ax);                    /* push ax */
+    push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
+    far_205A_2AC0(cpu);                      /* call 215A:2AC0 */
+    cpu->sp = (uint16_t)(flags_add16(cpu, cpu->sp, 0x2)); /* add sp, 0x2 */
+    flags_cmp16(cpu, cpu->ax, 0x2);          /* cmp ax, 0x2 */
+    if (cc_ge(cpu)) goto L_res_01D665_000469; /* jge 0x0469 */
+L_res_01D665_0004AB:;
+    cpu->si = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x56))); /* mov si, word ss:[bp+-0x56] */
+    { uint16_t _v = cpu->si; uint8_t _c = 0x1; uint16_t _r = _v << _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (16 - _c)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, _r); cpu->si = (uint16_t)(_r); } /* shl si, 0x1 */
+    cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, (uint16_t)(cpu->si + 0x64E2))); /* mov bx, word ds:[si+0x64E2] */
+    cpu->bx = (uint16_t)(flags_add16(cpu, cpu->bx, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6)))); /* add bx, word ss:[bp+0x6] */
+    mem_write8(cpu, cpu->ds, (uint16_t)(cpu->bx - 0x1), (uint8_t)(0x0)); /* mov byte ds:[bx+-0x1], 0x0 */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A)), 0x0); /* cmp word ss:[bp+-0x5A], 0x0 */
+    if (cc_ge(cpu)) goto L_res_01D665_0004C4; /* jge 0x04C4 */
+    goto L_res_01D665_0003D4;                /* jmp 0x03D4 */
+L_res_01D665_0004C4:;
+    cpu->ax = (uint16_t)(0x1);               /* mov ax, 0x1 */
+    cpu->cl = (uint8_t)(mem_read8(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A))); /* mov cl, byte ss:[bp+-0x5A] */
+    { uint16_t _v = cpu->ax; uint8_t _c = cpu->cl; uint16_t _r = _v << _c; cpu->flags = (cpu->flags & ~FLAG_CF) | ((_v >> (16 - _c)) & 1 ? FLAG_CF : 0); flags_shift16(cpu, _r); cpu->ax = (uint16_t)(_r); } /* shl ax, cl */
+    flags_logic16(cpu, mem_read16(cpu, cpu->ds, 0xE722) & cpu->ax); /* test word ds:[0xE722], ax */
+    if (cc_ne(cpu)) goto L_res_01D665_0004D5; /* jne 0x04D5 */
+    goto L_res_01D665_0003D4;                /* jmp 0x03D4 */
+L_res_01D665_0004D5:;
+    cpu->di = (uint16_t)(mem_read16(cpu, cpu->ds, (uint16_t)(cpu->si + 0x64E0))); /* mov di, word ds:[si+0x64E0] */
+    cpu->di = (uint16_t)(flags_add16(cpu, cpu->di, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0x6)))); /* add di, word ss:[bp+0x6] */
+    mem_write8(cpu, cpu->ds, cpu->di, (uint8_t)(0x5E)); /* mov byte ds:[di], 0x5E */
+    flags_cmp16(cpu, mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp - 0x5A)), 0x0); /* cmp word ss:[bp+-0x5A], 0x0 */
+    if (cc_l(cpu)) goto L_res_01D665_0004E8; /* jl 0x04E8 */
+    goto L_res_01D665_000393;                /* jmp 0x0393 */
+L_res_01D665_0004E8:;
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ds, 0x64DE)); /* mov ax, word ds:[0x64DE] */
+    goto L_res_01D665_0003A8;                /* jmp 0x03A8 */
+L_res_01D665_0004EE:;
+    cpu->ax = (uint16_t)(mem_read16(cpu, cpu->ss, (uint16_t)(cpu->bp + 0xC))); /* mov ax, word ss:[bp+0xC] */
+    cpu->si = (uint16_t)(pop16(cpu));        /* pop si */
+    cpu->di = (uint16_t)(pop16(cpu));        /* pop di */
+    cpu->sp = (uint16_t)(cpu->bp);           /* mov sp, bp */
+    cpu->bp = (uint16_t)(pop16(cpu));        /* pop bp */
+    cpu->sp += 4; return;                    /* retf */
 }

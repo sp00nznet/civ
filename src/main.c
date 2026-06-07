@@ -20,8 +20,47 @@
 /* Pull in the recompiled function declarations */
 #include "civ_recomp.h"
 
+/* ── Temporary crash diagnostics: resolve a segfault to a C symbol ── */
+#ifdef _WIN32
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+static LONG WINAPI civ_crash_filter(EXCEPTION_POINTERS *ep)
+{
+    void *frames[32];
+    USHORT n = CaptureStackBackTrace(0, 32, frames, NULL);
+    HANDLE proc = GetCurrentProcess();
+    SymInitialize(proc, NULL, TRUE);
+    fprintf(stderr, "\n[CRASH] code=0x%08lX addr=%p\n",
+            ep->ExceptionRecord->ExceptionCode,
+            ep->ExceptionRecord->ExceptionAddress);
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        fprintf(stderr, "[CRASH] access %s at 0x%p\n",
+                ep->ExceptionRecord->ExceptionInformation[0] ? "WRITE" : "READ",
+                (void *)ep->ExceptionRecord->ExceptionInformation[1]);
+    }
+    char buf[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+    sym->MaxNameLen = 255;
+    for (USHORT i = 0; i < n; i++) {
+        DWORD64 disp = 0;
+        if (SymFromAddr(proc, (DWORD64)(uintptr_t)frames[i], &disp, sym))
+            fprintf(stderr, "[CRASH]  #%2u %s +0x%llX\n", i, sym->Name,
+                    (unsigned long long)disp);
+        else
+            fprintf(stderr, "[CRASH]  #%2u %p\n", i, frames[i]);
+    }
+    fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
+
 /* Entry point provided by startup.c (replaces MSC crt0) */
 extern void res_02A310(CPU *cpu);
+
+/* Set by res_01FB68 when the title background arch.pic loads (diagnostics). */
+int g_arch_pic_loaded = 0;
 
 /* Poll callback: pumps SDL events and renders the framebuffer.
  * Called from within game code when it blocks waiting for input. */
@@ -61,11 +100,32 @@ static void game_poll_callback(void *platform_ctx, void *dos_state, const void *
                 rd, vmode, pal_rich, nzA, minx,miny,maxx,maxy,sample, nzC, nzD);
             /* Dump page-0 framebuffer (palette-applied) to a PPM once, to verify
              * content independent of SDL. */
-            static int dumped = 0;
-            if (!dumped && nzA > 100) {
-                dumped = 1;
+            /* When arch.pic (title background) has loaded and rendered, snapshot it. */
+            static int arch_dumped = 0;
+            if (!arch_dumped && g_arch_pic_loaded && nzA > 1500) {
+                arch_dumped = 1;
+                uint32_t rgba3[256]; video_get_rgba_palette(&dos->video, rgba3);
+                FILE *af = fopen("fb_title.ppm", "wb");
+                if (af) {
+                    fprintf(af, "P6\n320 200\n255\n");
+                    for (int i = 0; i < 320*200; i++) {
+                        uint32_t px = rgba3[c->mem[0xA0000 + i]];
+                        uint8_t rgb[3] = { (uint8_t)px, (uint8_t)(px>>8), (uint8_t)(px>>16) };
+                        fwrite(rgb, 1, 3, af);
+                    }
+                    fclose(af);
+                    fprintf(stderr, "[RENDERDIAG] wrote fb_title.ppm\n");
+                }
+            }
+            static int dumped = 0; static unsigned last_dump = 0;
+            if (getenv("CIV_DUMPALL") ? (dumped < 12 && nzA > 100 && (rd - last_dump) >= 16)
+                                      : (!dumped && nzA > 100)) {
+                dumped++; last_dump = rd;
+                char fbname[32];
+                if (getenv("CIV_DUMPALL")) snprintf(fbname, sizeof(fbname), "fb_%02d.ppm", dumped);
+                else snprintf(fbname, sizeof(fbname), "fb_dump.ppm");
                 uint32_t rgba2[256]; video_get_rgba_palette(&dos->video, rgba2);
-                FILE *f = fopen("fb_dump.ppm", "wb");
+                FILE *f = fopen(fbname, "wb");
                 if (f) {
                     fprintf(f, "P6\n320 200\n255\n");
                     for (int i = 0; i < 320*200; i++) {
@@ -74,7 +134,26 @@ static void game_poll_callback(void *platform_ctx, void *dos_state, const void *
                         fwrite(rgb, 1, 3, f);
                     }
                     fclose(f);
-                    fprintf(stderr, "[RENDERDIAG] wrote fb_dump.ppm\n");
+                }
+            }
+            /* CIV_DUMPLATEST: continuously overwrite fb_latest.ppm with the most
+             * recent frame (every 32 render-diags) so we can inspect the live
+             * game-loop screen (map) long after the bounded fb_NN dumps stop. */
+            if (getenv("CIV_DUMPLATEST") && nzA > 50) {
+                static unsigned last_latest = 0;
+                if (rd - last_latest >= 32) {
+                    last_latest = rd;
+                    uint32_t rgbaL[256]; video_get_rgba_palette(&dos->video, rgbaL);
+                    FILE *f = fopen("fb_latest.ppm", "wb");
+                    if (f) {
+                        fprintf(f, "P6\n320 200\n255\n");
+                        for (int i = 0; i < 320*200; i++) {
+                            uint32_t px = rgbaL[c->mem[0xA0000 + i]];
+                            uint8_t rgb[3] = { (uint8_t)px, (uint8_t)(px>>8), (uint8_t)(px>>16) };
+                            fwrite(rgb, 1, 3, f);
+                        }
+                        fclose(f);
+                    }
                 }
             }
             fflush(stderr);
@@ -303,6 +382,9 @@ int main(int argc, char *argv[])
      * TODO: Phase 4 - Add cooperative yielding so the game's internal
      * loops interleave with SDL event processing for proper rendering.
      */
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(civ_crash_filter);
+#endif
     CIV_ENTRY_POINT(&cpu);
 
     /* If the game returns without halting, run a post-game render loop */

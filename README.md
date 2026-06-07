@@ -485,19 +485,64 @@ py -3 tools/recomp/recomp.py path/to/civ.exe RecompiledFuncs
       `ungetc` `far_215A_16DA`, width-check `res_021C22`, skip-ws `res_021BEC`,
       scanf field reader `res_02178A`) against the host FILE table — the 79M-call
       credits-parse spin is **gone**; `credits.txt` now parses
-- [ ] Bad-filename pointer bug after credits (opens a stray DGROUP message string)
-      — next blocker to the interactive title/menu
+- [x] **Fixed the bad-filename pointer bug** — stale `civ_dump_lifted.c` double-pushed
+      CS for the MSC `push cs; call near <far-func>` idiom, so `far_1F67_01AD` read
+      `cs` instead of the filename; `king.txt` now opens cleanly
+- [x] **Implemented `res_02120A` (MSC `_getbuf`)** so `king.txt`'s 512-byte FILE
+      buffer is allocated and the `getc` chain reads — the intro completes
 
-### Phase 15 — Gameplay
+### Phase 15 — Color Rendering Pipeline (PIC → A0000 → palette)
 
-- [ ] Title screen + main menu (New Game / Load / Earth / Custom)
+- [x] **PIC LZW pixel decoder un-stubbed** — `far_0000_11FA` delegated decode to
+      stubs; correct implementations existed under the overlay-lifted twin names
+      (`res_001284`/`0012F6`/`00124E`/`001205`); wired the delegations
+- [x] **Fixed PIC display routing** — `far_0000_07E6` (row blitter) was mis-aliased
+      to `ovl05_02FFC2`; hand-implemented as a proper DS:src → A0000 row copy
+- [x] **VGA palette loaded** — Civ PICs are LBM-style chunked; the `M0` (0x304D)
+      chunk is the 768-byte 6-bit RGB palette. Parse it at PIC open and upload to
+      the DAC → **the intro renders in full colour** (starfield, stars, red credits)
+- [x] **MCGA mode 13h presents A0000** (SDL keys off `mem[0x449]==0x13`)
+- [x] Screen-grab sprite pair (`far_0000_076F`/`083F` host sprite store; title menu
+      save/restore works)
+
+### Phase 16 — Real Main Menu, World-Gen Completion & Game Loop
+
+- [x] **LOMEM false alarm — real root cause fixed.** `far_0000_0768` (the
+      free-memory query that gates the `*LOMEM` warning in `res_001A66`) was
+      *mis-aliased to the title screen* `ovl02_02C200`. That hack only worked while
+      the title was stubbed (returned AX=0x6000); with the title un-bypassed it
+      returned a small AX → an empty `*LOMEM` dialog blocked startup. Fixed to report
+      ample memory → **the real main menu now builds** ("Start a New Game / Load /
+      EARTH / Customize World / View Hall of Fame")
+- [x] **New Game selection works** — the menu string is king.txt message-DB text
+      (`far_1F67_01AD` hash lookup → `0xC936`); selecting New Game sets `6AC2=0`
+- [x] **Terrain-reveal infinite spin fixed → world-gen completes.** `far_1DDE_007C`
+      (== `res_01DE5C`, a signed `clamp(v,lo,hi)`) was a wrong "delay returns arg3"
+      stub → set the reveal timer target to `0x7FFF` (~30 min) so `ovl07_035B6E`'s
+      reveal loop spun forever. Implemented the real clamp → **world-gen finishes**
+- [x] **The game's main loop runs** — `begin_frame`/yield/timer/input cycling,
+      mode 13h, palette `210/224`. Full flow works end-to-end:
+      **intro → menu → New Game → world-gen → game loop**
+- [ ] Map tile rendering — the in-game map is a solid fill; `far_0000_083F` (tile/
+      sprite blitter, ~64 callers) is still a stub
+- [ ] **sp299.pic sprite-sheet decode** — its LZW refill reads a stale handle
+      (`DS:0x686C`→0); the loader skips the decode-context setup (`res_02013E`).
+      A new **Unicorn-engine harness** (modeled on the bolo recomp's `uni_*` tools)
+      will snapshot the original's memory at the sp299 load to recover the correct
+      setup
+- [ ] Interactive, screen-aware input to walk civ-select → the real game loop
+      (`res_0023F0`)
+
+### Phase 17 — Gameplay
+
+- [x] Title screen + main menu (New Game / Load / Earth / Custom)
 - [ ] Map tile rendering
 - [ ] UI chrome rendering
 - [ ] City management / diplomacy / combat / tech tree / wonders
 - [ ] Save/load game state
 - [ ] Hall of Fame
 
-### Phase 16 — Audio & Polish
+### Phase 18 — Audio & Polish
 
 - [ ] .CVL sound data loader
 - [ ] SDL2 audio output (AdLib OPL2 synthesis or PCM playback)

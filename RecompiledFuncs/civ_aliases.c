@@ -7,6 +7,7 @@
  */
 
 #include "recomp/cpu.h"
+#include <stdio.h>
 
 /* Near-call aliases for far functions lifted from dump */
 extern void far_085F_141F(CPU *cpu);
@@ -55,9 +56,13 @@ extern void ovl12_03D15C(CPU *cpu);  /* entry 91 */
  * civ_impl.c. See session log 2026-05-30. */
 void far_0000_0776(CPU *cpu) { ovl02_02D72A(cpu); }
 void far_0000_07B5(CPU *cpu) { ovl03_02E45D(cpu); }
-void far_0000_07E6(CPU *cpu) { ovl05_02FFC2(cpu); }
+/* far_0000_07E6 is the PIC row blitter (src linear buffer -> dst page row),
+ * NOT ovl05_02FFC2 (which mis-used arg1 as a page index). Implemented in
+ * civ_impl.c. See session 2026-06-01 §10. */
 /* far_0000_07F4 is the string renderer (called by res_001828), NOT
  * ovl05_0307DA — the sequential thunk assignment mis-mapped it. Hand-
  * implemented as an 8x8 text blit in civ_impl.c. See session 2026-05-31. */
 void far_0000_086B(CPU *cpu) { ovl07_0349D4(cpu); }
-void far_0000_09DE(CPU *cpu) { ovl12_03D15C(cpu); }
+/* far_0000_09DE is the blocking keyboard read (called by getkey far_1D1F_0AC9),
+ * NOT ovl12_03D15C (a score-string builder the link-order alias mis-assigned).
+ * Hand-implemented in civ_impl.c. See session 2026-06-01. */
