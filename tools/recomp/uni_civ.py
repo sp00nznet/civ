@@ -87,6 +87,12 @@ def main():
     # BIOS data area: conventional memory size (word at 0040:0013, in KB),
     # consistent with MEM_TOP so the overlay manager's cross-check doesn't fire.
     uc.mem_write(0x40 * 16 + 0x13, struct.pack("<H", MEM_TOP * 16 // 1024))
+    # An IRET stub at 0060:0000 as the default handler for hardware INTs the game
+    # hooks-and-chains (timer 8 / 1C, keyboard 9). When the game saves the "old"
+    # vector and chains to it, it lands on this harmless IRET instead of garbage.
+    uc.mem_write(0x600, b"\xCF")
+    for v in (0x08, 0x09, 0x1C):
+        uc.mem_write(v * 4, struct.pack("<HH", 0x0000, 0x0060))
 
     cs0 = (LOAD_SEG + e_cs) & 0xFFFF
     ss0 = (LOAD_SEG + e_ss) & 0xFFFF
@@ -113,6 +119,28 @@ def main():
         st["trace_n"] -= 1
         if st["trace_n"] == 0:
             st["stop"] = "trace done"; uc.emu_stop()
+
+    _ring = []
+    def hook_findjump(uc, address, size, _):
+        cs = uc.reg_read(R["cs"])
+        if cs in (0x0010, 0xFFCC) or address >= 0xFFFF0:   # entered the bad region
+            print(f"  --- bad jump into {cs:04x}:{uc.reg_read(R['ip']):04x} "
+                  f"(lin {address:#07x}); last sites (skipping zero runs): ---")
+            prev = None
+            for c, i, mn in _ring[-120:]:
+                if mn.startswith("add byte ptr [bx + si], al") and prev == "zero":
+                    continue
+                prev = "zero" if mn.startswith("add byte ptr [bx + si], al") else None
+                tag = " (zeros...)" if prev == "zero" else ""
+                print(f"    {c:04x}:{i:04x}  {mn}{tag}")
+            st["stop"] = "bad jump found"; uc.emu_stop(); return
+        if st.get("record"):
+            ip = uc.reg_read(R["ip"])
+            code = bytes(uc.mem_read(address, min(size, 8)))
+            ins = next(_md.disasm(code, ip), None)
+            _ring.append((cs, ip, f"{ins.mnemonic} {ins.op_str}" if ins else code.hex()))
+            if len(_ring) > 400:
+                del _ring[:200]
 
     def hook_code(uc, address, size, _):
         st["n"] += 1
@@ -194,15 +222,20 @@ def main():
                 uc.reg_write(R["ax"], 0x0005); return
             if ah == 0x48:                       # ALLOC paragraphs (BX)
                 bx = uc.reg_read(R["bx"])
-                # Floor the reported largest-free block: the game loads the
-                # graphics-driver overlay into (avail - 0x100) and its overrun
-                # check compares the driver size against that. When real free
-                # space is tiny (heap took it all), report >= 0x1000 so the
-                # driver gets a real block and fits (headless: VGA RAM above A000
-                # is unused, and TOTAL covers the writes).
-                avail = max(0x1000, ALLOC_CEIL - st["mem_free"])
+                avail = max(0, MEM_TOP - st["mem_free"])
+                # Big heap alloc: reserve headroom so the graphics/sound driver
+                # overlays (loaded later just above the heap) fit BELOW VGA (A000).
+                # Their relocations use the load segment, so loading them above
+                # A000 corrupts them -> bad far call into garbage.
+                if avail > 0x5000:
+                    avail -= 0xE00
+                # Floor small (driver-load) queries: the game loads the driver into
+                # (avail-0x100) and its overrun check compares the driver size to
+                # it; if avail<=0x100 then [0x53bc]=0 and any driver "overruns".
+                avail = max(0x1000, avail)
                 if bx <= avail:
-                    seg = st["mem_free"]; st["mem_free"] += bx
+                    seg = st["mem_free"]
+                    st["mem_free"] = min(MEM_TOP, st["mem_free"] + bx)  # never into VGA
                     print(f"  [INT21/48] alloc {bx:#x} para -> seg {seg:04X} (free now {st['mem_free']:04X})")
                     uc.reg_write(R["ax"], seg); cf(False)
                 else:
@@ -254,6 +287,8 @@ def main():
                     uc.reg_write(R["ax"], fd); cf(False)
                 else:
                     uc.reg_write(R["ax"], 0x02); cf(True)   # not found
+                if base.lower() == "credits.txt":
+                    st["record"] = 1           # start ring-recording near divergence
                 if SNAP_OPEN and SNAP_OPEN.lower() in base.lower():
                     dump_ctx(f"open {base}")
                 if STOP_OPEN and STOP_OPEN.lower() in base.lower():
@@ -413,6 +448,8 @@ def main():
         uc.hook_add(UC_HOOK_CODE, hook_code)
     if "--tracealloc" in av:
         uc.hook_add(UC_HOOK_CODE, hook_trace)
+    if "--findjump" in av:
+        uc.hook_add(UC_HOOK_CODE, hook_findjump)
     uc.hook_add(UC_HOOK_INTR, hook_intr)
     uc.hook_add(UC_HOOK_INSN, hook_in, None, 1, 0, UC_X86_INS_IN)
     uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED
@@ -427,6 +464,12 @@ def main():
     while done < NMAX and not st.get("stop"):
         st["ticks"] += 1
         uc.mem_write(0x46C, struct.pack("<I", st["ticks"]))
+        # NOTE: the game hooks INT 8 (PIT) and its graphics driver waits on a
+        # frame counter that handler increments (spin at mgraphic 9100:06c7,
+        # `cmp [0x440],al; je`). Firing INT 8 every slice here advances the
+        # frame-driven intro too fast and breaks it; pacing the timer ISR to the
+        # game's real cadence is the next step. An IRET chain-stub for the old
+        # vector is installed at 0060:0000 for when that's wired up.
         try:
             uc.emu_start(addr, TOTAL, count=SLICE)
         except UcError as e:

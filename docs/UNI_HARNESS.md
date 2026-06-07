@@ -70,15 +70,30 @@ sound driver (`Nsound.cvl`), then `logo.pic` / `birth0,1.pic` / `credits.txt` �
 **the exact intro assets the recomp loads** — i.e. it now runs the real game's
 intro headless.
 
-## Current wall: divergence after the credits
+## FIXED: post-credits divergence (drivers loaded above VGA)
 
-After `credits.txt` the game makes a bad control transfer and ends up executing
-zero-filled memory at `ffcc:0340` (lin `0x100000`) — a headless-fidelity issue:
-with INT 10h graphics / timer / sound only stubbed, some pointer goes wild. Use
-`--spin` to dump the stuck loop. Reaching the title menu (`king.txt`) and the
-sp299 load needs more faithful INT 10h (a real mode-13h framebuffer + the bits
-the intro reads back) and likely a real timer ISR (INT 8). `--tracealloc` /
-`--spin` are the diagnostics for chasing these.
+The bad jump into zero memory traced (via `--findjump`) to a far call into
+segment `ab00` — where the sound driver `Nsound.cvl` had loaded, *above* VGA
+(`A000`). The avail-floor that fixed the graphics overrun had advanced `mem_free`
+past `A000`, so drivers loaded into the VGA region and their relocations (by the
+load segment) produced garbage. Fix: in the allocator, **reserve `0xE00` paras of
+headroom on the big heap alloc** so the driver overlays load *below* `A000`, and
+**cap `mem_free` at `A000`** so allocations never enter VGA. Now the graphics
+driver loads at `9100`, the sound driver at `A000`, and the game runs the full
+intro (logo/birth/credits) with no divergence.
+
+## Current wall: graphics-driver frame-sync (timer ISR)
+
+After credits the game spins in the MCGA driver at `9100:06c7`
+(`cmp byte [0x440], al; je`) — waiting for a **frame counter the game's hooked
+INT 8 (PIT) handler increments**. Nothing fires INT 8 headless. An IRET chain
+stub for the old vector is installed at `0060:0000`, but firing INT 8 once per
+1 M-instruction slice advances the frame-driven intro too fast and breaks it — it
+needs **pacing to the game's real cadence** (fire ~once per N instructions tuned
+to 18.2 Hz, or only when the frame-wait spin is detected). That's the next step
+to reach the title menu (`king.txt`) and the sp299 load. Diagnostics:
+`--findjump` (trace a wild control transfer), `--spin` (dump a stuck loop),
+`--tracealloc` (single-step the alloc path).
 
 ## TODO / next
 
