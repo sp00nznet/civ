@@ -467,7 +467,11 @@ def main():
             # equal counts -> bx=0 -> div-by-zero -> INT0 retry loop. Make the
             # period depend on BX (the live inner-delay) so the counts differ.
             bxr = uc.reg_read(R["bx"]) & 0xFF
-            period = 800 - bxr * 12           # smaller delay -> longer -> more counts
+            # Bigger spread between the two calibration passes -> larger count
+            # difference -> SMALLER computed delay constant ([0x6b5]) -> the
+            # driver's per-frame CPU delay loops are short so the fade/animation
+            # completes quickly instead of crawling.
+            period = 1600 - bxr * 70
             if period < 200: period = 200
             phase = c % period
             v = 0
