@@ -4389,11 +4389,23 @@ static void pic_refill_buffer(CPU *cpu)
      * task #4). Until that's fixed, only dispatch the title/intro (0x1FB6) form;
      * sp299's 0x20B6 falls through to the warning and the game idles at the
      * post-sp299 screen instead of hanging. */
+    /* The refill callback is far_1FB6_0642 (== res_020191): read 512B of the .pic
+     * via far_205A_30E4 using the file token at DS:0x686C. The title/intro PICs
+     * set the callback seg to the unrelocated 0x1FB6; sp299.pic uses the relocated
+     * 0x20B6 (== 0x1FB6+LOAD_SEG). Dispatching the 0x20B6 form is CORRECT and reads
+     * real sp299 data for ~6 refills (3KB, [READ] h=5), BUT then far_205A_30E4
+     * resolves the 0xF200 token to h=0: the file slot is freed mid/post-decode
+     * while the decoder keeps requesting refills -> [READ] h=0 spin. Root: the
+     * sp299 sprite-sheet decode in far_0000_1080/far_0000_11FA doesn't terminate
+     * (its output-size target is wrong for a multi-sprite sheet vs a single LZW
+     * image), so it over-reads past the closed file. Fixing that (the decode
+     * loop's termination + file lifetime) is the task; until then dispatch only
+     * the 0x1FB6 form so sp299 idles instead of hanging. */
     if (cb_off == 0x0642 && cb_seg == 0x1FB6) {
         push16(cpu, cpu->cs); push16(cpu, 0);
         res_020191(cpu);
     } else {
-        fprintf(stderr, "[WARN] PIC: Unknown callback %04X:%04X\n", cb_seg, cb_off);
+        static int _w=0; if(++_w<=2) fprintf(stderr, "[WARN] PIC: Unknown callback %04X:%04X\n", cb_seg, cb_off);
     }
     cpu->dx = pop16(cpu);
     cpu->cx = pop16(cpu);
