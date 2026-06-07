@@ -491,6 +491,13 @@ def main():
         uc.hook_add(UC_HOOK_CODE, hook_findjump)
     uc.hook_add(UC_HOOK_INTR, hook_intr)
     uc.hook_add(UC_HOOK_INSN, hook_in, None, 1, 0, UC_X86_INS_IN)
+    if "--findfb" in av:
+        wpg = st.setdefault("wpg", {})
+        def hook_mw(uc, access, address, size, value, _):
+            if st.get("record"):                  # only after credits (at title)
+                p = address >> 12
+                wpg[p] = wpg.get(p, 0) + 1
+        uc.hook_add(UC_HOOK_MEM_WRITE, hook_mw)
     uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED
                 | UC_HOOK_MEM_FETCH_UNMAPPED, hook_mem_invalid)
 
@@ -575,30 +582,39 @@ def main():
     print("  file opens:", st["opens"])
     print(f"  INT16 calls={st.get('i16',0)} AH-breakdown={st.get('i16ah',{})} "
           f"keys-pushed={st.get('ki9',0)}")
+    if st.get("wpg"):
+        top = sorted(st["wpg"].items(), key=lambda kv: -kv[1])[:12]
+        print("  [FINDFB] hottest write 4KB-pages (lin base : count):")
+        for p, n in top:
+            print(f"    {p<<12:#08x} : {n}")
+        # dump 320x200 images at the top few page bases so we can spot the menu fb
+        os.makedirs("work", exist_ok=True)
+        for idx, (p, n) in enumerate(top[:4]):
+            base = (p << 12) & ~0xFF              # nudge to a round-ish start
+            img = bytes(uc.mem_read(base, 64000))
+            with open(f"work/findfb_{idx}_{base:06x}.ppm", "wb") as f:
+                f.write(b"P6\n320 200\n255\n")
+                for b in img:
+                    f.write(bytes([(b * 7) & 0xFF, (b * 3) & 0xFF, (b * 5) & 0xFF]))
+            print(f"    -> wrote work/findfb_{idx}_{base:06x}.ppm")
     # dump the MCGA mode-13h framebuffer (A0000, 320x200x8) so we can SEE graphics
     # screens (menu/map). No DAC palette emulated -> write a grayscale-ish PPM
     # keyed on the index so structure is visible.
     fb = st.get("fb_best") or bytes(uc.mem_read(0xA0000, 320 * 200))
     nz = sum(1 for b in fb if b)
     print(f"  [FB13] A0000 nonzero={nz}/64000 best-variety={st.get('fb_var',0)}")
-    # Hunt the offscreen framebuffer: scan paragraph-aligned 64000-byte windows
-    # for one with image-like variety (many distinct bytes, not mostly zero).
-    best = (1, 0xA0000, fb)
-    full = bytes(uc.mem_read(0, min(TOTAL, 0xC0000)))
-    for base in range(0x10000, len(full) - 64000, 0x400):
-        win = full[base:base + 64000]
-        s = win[::149]
-        v = len(set(s))
-        if v > best[0] and s.count(0) < 300:       # varied + not mostly-zero
-            best = (v, base, win)
-    var, base, fbimg = best
-    print(f"  [FBSCAN] richest 64000B window: lin {base:#08x} variety={var}")
+    # The MCGA driver renders to an OFFSCREEN buffer (not linear A0000); empirically
+    # it sits at ~0x4A000 (just below the loaded overlays). Dump it so we can SEE
+    # the title/menu screen. FB_BASE can be overridden via --fb <hex>.
+    fb_base = int(arg(av, "--fb", "0x4a000"), 16)
+    fbimg = bytes(uc.mem_read(fb_base, 64000))
     os.makedirs("work", exist_ok=True)
-    with open("work/uni_fb13.ppm", "wb") as f:
+    with open("work/uni_screen.ppm", "wb") as f:
         f.write(b"P6\n320 200\n255\n")
         for b in fbimg:
             f.write(bytes([(b * 7) & 0xFF, (b * 3) & 0xFF, (b * 5) & 0xFF]))
-    print("  wrote work/uni_fb13.ppm")
+    print(f"  [SCREEN] offscreen fb @ {fb_base:#08x} -> work/uni_screen.ppm "
+          f"(distinct={len(set(fbimg[::101]))})")
     # dump the text-mode screen (0xB8000, 80x25, char in even bytes) so we can SEE
     # which text screen the game is on and feed the right keys.
     print("  --- text screen (B8000) ---")
