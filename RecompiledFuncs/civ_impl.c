@@ -348,6 +348,23 @@ void far_0000_16C6(CPU *cpu)
  * EA6E=[0x5820]; else zero all three. */
 void far_01A7_0225(CPU *cpu)
 {
+    /* Wire the host SDL mouse into the game's DGROUP mouse vars. The game's mouse
+     * ISR (registered via INT 33h 0x0C) normally maintains these on mouse events,
+     * but the recomp doesn't run the ISR — so populate them here from dos->mouse
+     * (position [0x581E]/[0x5820], button state [0x5822], and the sticky
+     * button-down latch into [0x5824] so single clicks aren't missed). This makes
+     * the menus / map clickable. */
+    {
+        DosState *dos = get_dos_state(cpu);
+        mem_write16(cpu, cpu->ds, 0x581E, (uint16_t)dos->mouse.x);
+        mem_write16(cpu, cpu->ds, 0x5820, (uint16_t)dos->mouse.y);
+        mem_write16(cpu, cpu->ds, 0x5822, dos->mouse.buttons);
+        if (dos->mouse.clicked) {
+            mem_write16(cpu, cpu->ds, 0x5824,
+                        (uint16_t)(mem_read16(cpu, cpu->ds, 0x5824) | dos->mouse.clicked));
+            dos->mouse.clicked = 0;
+        }
+    }
     if (mem_read16(cpu, cpu->ds, 0x1A3C) != 0) {
         push16(cpu, cpu->cs); push16(cpu, 0);
         far_0000_16C6(cpu);                       /* ax = mouse-click latch */

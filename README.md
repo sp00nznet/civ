@@ -7,9 +7,9 @@
 
 ![Civilization title screen running natively via static recompilation](docs/screenshots/title.png)
 
-*The recompiled title screen running natively on Windows 11 — the full intro
-(logo → birth → credits in color) plays, then the menu builds from `king.txt`,
-and New Game drives world generation, the sprite-sheet decode, and the
+*The recompiled "Sid Meier's CIVILIZATION" title, decoded pixel-perfect and
+running natively on Windows 11. The full intro (logo → birth → credits, in color)
+plays, then New Game drives world generation, the sprite-sheet decode, and the
 civilization-select screen.*
 
 ---

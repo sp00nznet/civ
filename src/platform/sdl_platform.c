@@ -189,10 +189,12 @@ void platform_poll_events(Platform *plat, DosState *dos)
             if (e.button.button == SDL_BUTTON_LEFT)   mask = 0x01;
             if (e.button.button == SDL_BUTTON_RIGHT)  mask = 0x02;
             if (e.button.button == SDL_BUTTON_MIDDLE) mask = 0x04;
-            if (e.type == SDL_MOUSEBUTTONDOWN)
+            if (e.type == SDL_MOUSEBUTTONDOWN) {
                 btn |= mask;
-            else
+                dos->mouse.clicked |= mask;   /* latch the button-down edge */
+            } else {
                 btn &= ~mask;
+            }
             dos->mouse.buttons = btn;
             break;
         }

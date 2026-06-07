@@ -29,6 +29,7 @@ typedef struct {
     int16_t  x;
     int16_t  y;
     uint16_t buttons;       /* bit 0 = left, bit 1 = right, bit 2 = middle */
+    uint16_t clicked;       /* button-down edge latch (sticky until consumed) */
     int      visible;
     int16_t  min_x, max_x;
     int16_t  min_y, max_y;
