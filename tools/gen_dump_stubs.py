@@ -40,6 +40,14 @@ SYMBOLS = [
 def main():
     stubs_file = "RecompiledFuncs/civ_stubs.c"
 
+    # The list below is a snapshot. Pass a file of symbol names (one per
+    # line) to use the *current* relift's unresolved set instead:
+    #   py -3 tools/recomp/lift_from_dump.py <dump> RecompiledFuncs \n    #     | sed -n "/^Unresolved/,$p" | grep -oE "[a-z]+[0-9A-Za-z_]+" > syms.txt
+    #   py -3 tools/gen_dump_stubs.py syms.txt
+    global SYMBOLS
+    if len(sys.argv) > 1:
+        SYMBOLS = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+
     with open(stubs_file, 'r') as f:
         lines = f.readlines()
 
@@ -50,6 +58,19 @@ def main():
             break
 
     existing = ''.join(lines)
+
+    # A symbol the dump lift called but could not see is only missing if
+    # nothing else defines it -- civ_impl.c and the aliases do define some,
+    # and a second definition here is a duplicate-symbol link error.
+    import glob, os, re
+    defined = set()
+    for f2 in glob.glob('RecompiledFuncs/*.c'):
+        if os.path.basename(f2) == 'civ_stubs.c':
+            continue
+        src = open(f2, encoding='utf-8', errors='replace').read()
+        defined.update(re.findall(r'^void\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(CPU\s*\*\s*cpu\)\s*(?:\{|$)',
+                                  src, re.M))
+    SYMBOLS = [x for x in SYMBOLS if x not in defined]
     with open(stubs_file, 'w', newline='\n') as f:
         f.writelines(lines)
         f.write('\n/* --- Additional stubs for dump-lifted dependencies --- */\n')

@@ -40,7 +40,30 @@ extern void res_020FA0(CPU *cpu);
  * they go through the host table.
  */
 #define CIV_FILE_MAX     8
-#define CIV_FILE_TOKEN_BASE 0xF200   /* token = base | (slot*8); not a real DS offset */
+
+/* The token is a REAL DS address of a real (small) MSC FILE struct.
+ *
+ * It used to be an opaque 0xF200|slot that was not a DS offset at all, which
+ * held up only while the CRT file code was dead: every `call far [mem]` lifted
+ * to /* UNHANDLED *\/, so nothing ever dereferenced a FILE. Once indirect
+ * calls dispatched, the real CRT ran, read fields off an address that was not
+ * a struct, and produced a garbage refill callback and a garbage filename.
+ *
+ * The array sits at the bottom of the guest heap and heap_break starts just
+ * above it, so the game allocator -- which only ever hands out memory upward
+ * from heap_break -- can never collide with it. That is why this address is
+ * safe by construction rather than by inspection.
+ *
+ * MSC 5.x small-model layout, 8 bytes:
+ *   +0 _ptr (near)   +2 _cnt   +4 _base (near)   +6 _flag   +7 _file
+ */
+#define CIV_FILE_STRUCT_BASE 0xF7F0
+#define CIV_FILE_STRUCT_SIZE 8
+#define CIV_FILE_AREA_END    (CIV_FILE_STRUCT_BASE + CIV_FILE_MAX * CIV_FILE_STRUCT_SIZE)
+#define CIV_FILE_TOKEN_BASE  CIV_FILE_STRUCT_BASE
+/* MSC _iobuf flags */
+#define CIV_IOREAD 0x01
+#define CIV_IORW   0x80
 
 typedef struct {
     uint8_t  dos_handle;
@@ -50,14 +73,26 @@ typedef struct {
 static CivFileSlot g_civ_files[CIV_FILE_MAX];
 
 static int civ_file_token_to_slot(uint16_t tok) {
-    if ((tok & 0xFFC7) != CIV_FILE_TOKEN_BASE) return -1; /* not our token */
-    int slot = (tok >> 3) & 0x07;
+    int slot;
+    if (tok < CIV_FILE_STRUCT_BASE || tok >= CIV_FILE_AREA_END) return -1;
+    if ((tok - CIV_FILE_STRUCT_BASE) % CIV_FILE_STRUCT_SIZE) return -1;
+    slot = (tok - CIV_FILE_STRUCT_BASE) / CIV_FILE_STRUCT_SIZE;
     if (!g_civ_files[slot].in_use) return -1;
     return slot;
 }
 
 static uint16_t civ_file_slot_to_token(int slot) {
-    return (uint16_t)(CIV_FILE_TOKEN_BASE | (slot * 8));
+    return (uint16_t)(CIV_FILE_STRUCT_BASE + slot * CIV_FILE_STRUCT_SIZE);
+}
+
+/* Give the guest a FILE it can actually read fields out of. */
+static void civ_file_init_struct(CPU *cpu, int slot, uint8_t handle) {
+    uint16_t f = civ_file_slot_to_token(slot);
+    mem_write16(cpu, cpu->ds, (uint16_t)(f + 0), 0);       /* _ptr  */
+    mem_write16(cpu, cpu->ds, (uint16_t)(f + 2), 0);       /* _cnt  */
+    mem_write16(cpu, cpu->ds, (uint16_t)(f + 4), 0);       /* _base */
+    mem_write8 (cpu, cpu->ds, (uint16_t)(f + 6), CIV_IOREAD);
+    mem_write8 (cpu, cpu->ds, (uint16_t)(f + 7), handle);  /* _file */
 }
 
 /* Most-recently-loaded PIC palette (6-bit RGB), applied by far_0000_07E6.
@@ -94,6 +129,8 @@ static void civ_load_pic_palette(const char *path) {
 }
 
 void res_01FB68(CPU *cpu) {
+    RECOMP_TRACE(cpu, "res_01FB68");
+    RECOMP_SP_ENTRY(cpu);
     /* Args: [sp+4]=filename_ptr, [sp+6]=mode (0=read binary) */
     uint16_t fn_off = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
 
@@ -125,10 +162,31 @@ void res_01FB68(CPU *cpu) {
 
     if (cpu->flags & FLAG_CF) {
         fprintf(stderr, "[FOPEN] '%s' FAILED\n", path);
+        { extern void recomp_trace_ring(const char *);
+          recomp_trace_ring("fopen given a bad name"); }
+        /* The right pointer is probably still on the stack, one or two words
+         * from where we looked. Print the frame and flag every word that
+         * points at printable text, which names the correct offset outright. */
+        { int w;
+          fprintf(stderr, "[ARGS] sp=%04X bp=%04X\n", cpu->sp, cpu->bp);
+          for (w = 0; w < 10; w++) {
+              uint16_t off = (uint16_t)(cpu->sp + w * 2);
+              uint16_t val = mem_read16(cpu, cpu->ss, off);
+              char txt[17]; int c, printable = 1;
+              for (c = 0; c < 16; c++) {
+                  uint8_t ch = mem_read8(cpu, cpu->ds, (uint16_t)(val + c));
+                  if (ch == 0) break;
+                  if (ch < 32 || ch > 126) { printable = 0; break; }
+                  txt[c] = (char)ch;
+              }
+              txt[c] = 0;
+              fprintf(stderr, "[ARGS]   sp+%02d = %04X%s\n", w * 2, val,
+                      (printable && c >= 3) ? txt : "");
+          } }
         cpu->ax = 0; /* return NULL */
         cpu->bx = saved_bx; cpu->cx = saved_cx; cpu->dx = saved_dx;
         cpu->sp += 4; /* far ret */
-        return;
+        { RECOMP_CHECK_SP(cpu, "res_01FB68"); return; }
     }
 
     uint8_t handle = (uint8_t)(cpu->ax & 0xFF);
@@ -144,7 +202,7 @@ void res_01FB68(CPU *cpu) {
         cpu->ax = 0;
         cpu->bx = saved_bx; cpu->cx = saved_cx; cpu->dx = saved_dx;
         cpu->sp += 4;
-        return;
+        { RECOMP_CHECK_SP(cpu, "res_01FB68"); return; }
     }
 
     g_civ_files[slot].dos_handle = handle;
@@ -152,19 +210,39 @@ void res_01FB68(CPU *cpu) {
 
     uint16_t token = civ_file_slot_to_token(slot);
 
+    /* Populate the struct the token now points at, so CRT code that walks a
+     * FILE reads real fields instead of whatever was in memory. */
+    civ_file_init_struct(cpu, slot, (uint8_t)handle);
+
     /* Store as current FILE for the game's PIC decoder fallback path. */
     mem_write16(cpu, cpu->ds, 0x54DA, token);
 
     fprintf(stderr, "[FOPEN] '%s' -> handle %d, token %04X (slot %d)\n",
             path, handle, token, slot);
 
+    /* Install the buffered-read refill callback for this stream.
+     *
+     * The real CRT sets this up when it opens a stream; we return an opaque
+     * token and skip all of that, so the slot held whatever was there. The
+     * buffered path does `call far word ds:[0xE84A]` to top the buffer up
+     * (uni_civ.py calls the slot "cb_off"), and with a stale value it read
+     * plain data as a function pointer and retried millions of times.
+     * far_1FB6_0642 is that routine, at image seg:off 1FB6:0642 -- the form
+     * the dispatch table is keyed on. Written per open, not once at boot,
+     * because something between boot and here clears it. */
+    mem_write16(cpu, cpu->ds, 0xE84A, 0x0642);
+    mem_write16(cpu, cpu->ds, 0xE84C, 0x1FB6);
+
     cpu->ax = token;
     cpu->bx = saved_bx; cpu->cx = saved_cx; cpu->dx = saved_dx;
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "res_01FB68");
 }
 
 /* res_01FBFC - fclose */
 void res_01FBFC(CPU *cpu) {
+    RECOMP_TRACE(cpu, "res_01FBFC");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t token = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
     int slot = civ_file_token_to_slot(token);
     if (slot >= 0) {
@@ -179,6 +257,7 @@ void res_01FBFC(CPU *cpu) {
     }
     cpu->ax = 0;
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "res_01FBFC");
 }
 
 /* ─── MSC CRT: getch() ─── */
@@ -188,17 +267,19 @@ void res_01FBFC(CPU *cpu) {
  * second call returns the scan code. */
 void far_205A_20AA(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_205A_20AA");
+    RECOMP_SP_ENTRY(cpu);
     static uint8_t pending_scan = 0;
     if (pending_scan) {
         cpu->ax = (uint16_t)pending_scan;
         pending_scan = 0;
         cpu->sp += 4; /* far ret (was missing -> stack corruption) */
-        return;
+        { RECOMP_CHECK_SP(cpu, "far_205A_20AA"); return; }
     }
     /* Deterministic key script: feed Enter to advance dialogs/prompts (e.g. the
      * civ-select screen waits on getch). Lets CIV_KEYSCRIPT drive past it. */
     { const char *ks = getenv("CIV_KEYSCRIPT");
-      if (ks && ks[0]) { cpu->ax = 0x0D; cpu->sp += 4; return; } }
+      if (ks && ks[0]) { cpu->ax = 0x0D; cpu->sp += 4; { RECOMP_CHECK_SP(cpu, "far_205A_20AA"); return; } } }
     DosState *dos = get_dos_state(cpu);
     fprintf(stderr, "[BLOCK] Waiting for key in far_205A_20AA (getch)\n");
     while (!keyboard_available(&dos->keyboard)) {
@@ -215,14 +296,44 @@ void far_205A_20AA(CPU *cpu)
         cpu->ax = (uint16_t)ascii;
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_205A_20AA");
 }
 
 /* ─── MSC CRT: kbhit() ─── */
 /* far_205A_2096 - Check if a key is available in the keyboard buffer.
  * Returns AX=0x00FF if key available, AX=0x0000 if not.
  * Pumps the SDL event loop before checking. */
+/* ASCII -> PC scancode, for keys we synthesise.
+ *
+ * A real keypress carries a scancode in AH; auto-injected keys were pushed
+ * with scancode 0, so any game check on AH failed against them. The keyscript
+ * path already synthesises one -- this gives the autokey path the same.
+ * Covers the keys a menu actually uses; anything else keeps 0, which is no
+ * worse than before. */
+static uint8_t civ_scancode_for(uint8_t a)
+{
+    static const char *row = "1234567890";
+    static const char *alpha = "qwertyuiop asdfghjkl  zxcvbnm";
+    static const uint8_t alpha_sc[] = {
+        0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x00,
+        0x1E,0x1F,0x20,0x21,0x22,0x23,0x24,0x25,0x26,0x00,0x00,
+        0x2C,0x2D,0x2E,0x2F,0x30,0x31,0x32 };
+    const char *p;
+    if (a == ' ')  return 0x39;
+    if (a == '\r' || a == '\n') return 0x1C;
+    if (a == 0x1B) return 0x01;   /* Esc */
+    if (a >= 0x41 && a <= 0x5A) a = (uint8_t)(a + 32);   /* fold case */
+    p = strchr(row, a);
+    if (p && a) return (uint8_t)(0x02 + (p - row));
+    p = strchr(alpha, a);
+    if (p && a) return alpha_sc[p - alpha];
+    return 0x00;
+}
+
 void far_205A_2096(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_205A_2096");
+    RECOMP_SP_ENTRY(cpu);
     static uint64_t call_count = 0;
     call_count++;
     DosState *dos = get_dos_state(cpu);
@@ -246,13 +357,21 @@ void far_205A_2096(CPU *cpu)
     if (!ak_init) {
         ak_init = 1;
         ak_seq = getenv("CIV_AUTOKEY");
-        if (ak_seq && ak_seq[0]) ak_period = 5; else ak_seq = " ";
+        /* Inject on every poll with an empty buffer. The menu loop reads a key
+         * only when kbhit reports one, so a 1-in-5 rate meant 22 polls
+         * produced a single getkey and the menu effectively never saw
+         * input. */
+        if (ak_seq && ak_seq[0]) ak_period = 1; else ak_seq = " ";
     }
     if (!keyboard_available(&dos->keyboard) && call_count >= (uint64_t)ak_period &&
         (call_count % ak_period) == 0) {
         int len = (int)strlen(ak_seq);
         uint8_t a = (uint8_t)ak_seq[ak_idx % (len ? len : 1)];
         ak_idx++;
+        /* Scancode 0 on purpose: the menu loop in ovl02_02C200 does
+         * `cmp ax, 0x6E` against the FULL AX, so a key must arrive as bare
+         * ASCII. Giving injected keys a scancode makes AX 0x316E and every
+         * menu comparison fails. */
         keyboard_push(&dos->keyboard, 0, a);
         fprintf(stderr, "[KBHIT] Auto-injected key 0x%02X at poll #%llu\n",
                 a, (unsigned long long)call_count);
@@ -261,7 +380,7 @@ void far_205A_2096(CPU *cpu)
     /* With a deterministic key script, always report "key available" so the
      * script getkey (far_0000_09DE) is reached on every poll. */
     { const char *ks = getenv("CIV_KEYSCRIPT");
-      if (ks && ks[0]) { cpu->ax = 0x00FF; cpu->sp += 4; return; } }
+      if (ks && ks[0]) { cpu->ax = 0x00FF; cpu->sp += 4; { RECOMP_CHECK_SP(cpu, "far_205A_2096"); return; } } }
     cpu->ax = keyboard_available(&dos->keyboard) ? 0x00FF : 0x0000;
     if (call_count <= 5 || (call_count % 500) == 0) {
         fprintf(stderr, "[KBHIT] #%llu result=%u\n",
@@ -269,6 +388,7 @@ void far_205A_2096(CPU *cpu)
         fflush(stderr);
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_205A_2096");
 }
 
 /* far_0000_09DE - blocking keyboard read (INT 16h AH=0 equivalent).
@@ -282,6 +402,8 @@ void far_205A_2096(CPU *cpu)
  * (see the standing warning about the 0x0761 runtime-patched thunk table). */
 void far_0000_09DE(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_09DE");
+    RECOMP_SP_ENTRY(cpu);
     extern void platform_delay(uint32_t ms);
     DosState *dos = get_dos_state(cpu);
     /* Deterministic key script: CIV_KEYSCRIPT=<chars> returns one char per getkey
@@ -305,7 +427,7 @@ void far_0000_09DE(CPU *cpu)
         static int _ks=0; if (++_ks <= 40)
             fprintf(stderr, "[KEYSCRIPT] #%d getkey -> 0x%04X '%c'\n", _ks, cpu->ax, (c>=32&&c<127)?c:'.');
         fflush(stderr);
-        cpu->sp += 4; return;
+        cpu->sp += 4; { RECOMP_CHECK_SP(cpu, "far_0000_09DE"); return; }
       } }
     /* Block until a key is available, pumping SDL so the window stays live and
      * a small delay keeps us off 100% CPU. The title menu only calls this after
@@ -322,6 +444,7 @@ void far_0000_09DE(CPU *cpu)
         fflush(stderr);
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_09DE");
 }
 
 /* ─── New-Game setup input chain (lifted from dump) ───
@@ -338,9 +461,12 @@ extern void far_205A_20AA(CPU *cpu);
 /* far_0000_16C6 - read+clear the mouse-click latch DS:[0x5824] (0 = none). */
 void far_0000_16C6(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_16C6");
+    RECOMP_SP_ENTRY(cpu);
     cpu->ax = mem_read16(cpu, cpu->ds, 0x5824);
     mem_write16(cpu, cpu->ds, 0x5824, 0);
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_16C6");
 }
 
 /* far_01A7_0225 - snapshot mouse/cursor state into DS:[0xEA6A/0xEA6C/0xEA6E].
@@ -348,6 +474,8 @@ void far_0000_16C6(CPU *cpu)
  * EA6E=[0x5820]; else zero all three. */
 void far_01A7_0225(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_01A7_0225");
+    RECOMP_SP_ENTRY(cpu);
     /* Wire the host SDL mouse into the game's DGROUP mouse vars. The game's mouse
      * ISR (registered via INT 33h 0x0C) normally maintains these on mouse events,
      * but the recomp doesn't run the ISR — so populate them here from dos->mouse
@@ -378,6 +506,7 @@ void far_01A7_0225(CPU *cpu)
         mem_write16(cpu, cpu->ds, 0xEA6A, 0);
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_01A7_0225");
 }
 
 /* far_1436_0918 - the setup screen's input wait (@0x14C78). Yields, then loops
@@ -386,6 +515,8 @@ void far_01A7_0225(CPU *cpu)
  *   if EA6A==0 { k=getch(); if k==0 getch(); }  ; returns key in AX */
 void far_1436_0918(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_1436_0918");
+    RECOMP_SP_ENTRY(cpu);
     push16(cpu, cpu->cs); push16(cpu, 0); far_0402_44E9(cpu);   /* yield */
     for (;;) {
         push16(cpu, cpu->cs); push16(cpu, 0); far_01A7_0225(cpu); /* mouse */
@@ -400,6 +531,7 @@ void far_1436_0918(CPU *cpu)
         }
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_1436_0918");
 }
 
 /* ─── MSC CRT: fgetc from stdin ─── */
@@ -408,6 +540,8 @@ void far_1436_0918(CPU *cpu)
  * This is the actual fgetc implementation from MSC 5.x CRT. */
 void res_021BAE(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_021BAE");
+    RECOMP_SP_ENTRY(cpu);
     push16(cpu, cpu->si);
     { int _cf = cf(cpu); mem_write16(cpu, cpu->ds, 0x6AB8, (uint16_t)(flags_add16(cpu, mem_read16(cpu, cpu->ds, 0x6AB8), 1))); if (_cf) cpu->flags |= FLAG_CF; else cpu->flags &= ~FLAG_CF; }
     cpu->bx = (uint16_t)(mem_read16(cpu, cpu->ds, 0x6AA0));
@@ -427,13 +561,16 @@ L_res_021BAE_done:;
     { static int gc=0; gc++; if ((gc >= 30 && gc <= 50) || (gc >= 100 && gc <= 120)) { fprintf(stderr, "[GETC] #%d ch=%02X('%c')\n", gc, cpu->ax, (cpu->ax >= 0x20 && cpu->ax < 0x7F) ? cpu->ax : '.'); fflush(stderr); } }
     cpu->si = (uint16_t)(pop16(cpu));
     cpu->sp += 4; /* far ret - callers use push cs + call near */
-    return;
+    { RECOMP_CHECK_SP(cpu, "res_021BAE"); return; }
 }
 
 /* res_031BAE - Alias for res_021BAE (address differs by 0x10000) */
 void res_031BAE(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_031BAE");
+    RECOMP_SP_ENTRY(cpu);
     res_021BAE(cpu);
+    RECOMP_CHECK_SP(cpu, "res_031BAE");
 }
 
 /* ─── Display: end frame ─── */
@@ -442,6 +579,8 @@ void res_031BAE(CPU *cpu)
  * GFX struct[+00] = page flag (0=direct, 1=page1, 2=page2). */
 void far_01A7_0252(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_01A7_0252");
+    RECOMP_SP_ENTRY(cpu);
     static int call_count = 0;
     call_count++;
     uint16_t gfx_ptr = mem_read16(cpu, cpu->ds, 0xAA);
@@ -469,25 +608,32 @@ void far_01A7_0252(CPU *cpu)
         dos->poll_events(dos->platform_ctx, dos, cpu);
 
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_01A7_0252");
 }
 
 /* ─── Display: begin frame ─── */
 /* far_01A7_026A - Begin a new display frame. */
 void far_01A7_026A(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_01A7_026A");
+    RECOMP_SP_ENTRY(cpu);
     static int frame_count = 0;
     frame_count++;
     if (frame_count <= 5 || (frame_count % 100) == 0)
         fprintf(stderr, "[FRAME] begin_frame #%d\n", frame_count);
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_01A7_026A");
 }
 
 /* ─── Display: clear/setup ─── */
 /* far_085F_257B - Clear or setup the display (no-op). */
 void far_085F_257B(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_085F_257B");
+    RECOMP_SP_ENTRY(cpu);
     (void)cpu;
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_085F_257B");
 }
 
 /* far_0000_0825 - Timer/VBlank interrupt handler.
@@ -498,9 +644,12 @@ void far_085F_257B(CPU *cpu)
  * CS:0x065A = real address 0x100*16 + 0x065A = 0x165A. */
 void far_0000_0825(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_0825");
+    RECOMP_SP_ENTRY(cpu);
     /* Set the timer/VBlank flag */
     mem_write16(cpu, 0x0100, 0x065A, 1);
     cpu->sp += 4; /* far ret (original uses IRET but we just return) */
+    RECOMP_CHECK_SP(cpu, "far_0000_0825");
 }
 
 /* far_0000_08B8 - Begin drawing / set clip rect.
@@ -509,8 +658,11 @@ void far_0000_0825(CPU *cpu)
  * This is a no-arg GFX primitive, stub as no-op until VGA drawing is implemented. */
 void far_0000_08B8(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_08B8");
+    RECOMP_SP_ENTRY(cpu);
     (void)cpu;
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_08B8");
 }
 
 /* far_0000_0880 - Set draw color/style.
@@ -518,8 +670,11 @@ void far_0000_08B8(CPU *cpu)
  * Called from res_000FE8 with color in ax, no pushed args. */
 void far_0000_0880(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_0880");
+    RECOMP_SP_ENTRY(cpu);
     (void)cpu;
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_0880");
 }
 
 /* far_0000_0879 - End drawing / restore clip.
@@ -527,8 +682,11 @@ void far_0000_0880(CPU *cpu)
  * Called from res_000FE8 after line drawing, no args. */
 void far_0000_0879(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_0879");
+    RECOMP_SP_ENTRY(cpu);
     (void)cpu;
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_0879");
 }
 
 /* ─── GFX: char width ─── */
@@ -538,8 +696,11 @@ void far_0000_0879(CPU *cpu)
  * Returns char width in AX. We return 8 (standard 8-pixel font). */
 void far_0000_077D(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_077D");
+    RECOMP_SP_ENTRY(cpu);
     cpu->ax = 8;  /* standard 8px char width */
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_077D");
 }
 
 /* ─── GFX sprite store: screen-grab capture + blit (far_0000_076F / _083F) ───
@@ -569,6 +730,8 @@ static int sprite_is_handle(uint16_t v) { return (v & 0xF000) == 0x4000; }
  * recursion; this is the real screen-grab primitive.) */
 void far_0000_076F(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_076F");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t sp = (uint16_t)(cpu->sp + 4); /* skip far return address */
     int16_t  flag   = (int16_t)mem_read16(cpu, cpu->ss, sp);
     int16_t  x      = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 2));
@@ -589,7 +752,7 @@ void far_0000_076F(CPU *cpu)
     int slot = -1;
     for (int i = 0; i < SPRITE_STORE_MAX; i++) if (!g_sprites[i].used) { slot = i; break; }
     if (slot < 0 || width <= 0 || height <= 0 || width > 320 || height > 200) {
-        cpu->ax = 0; cpu->sp += 4; return;
+        cpu->ax = 0; cpu->sp += 4; { RECOMP_CHECK_SP(cpu, "far_0000_076F"); return; }
     }
 
     HostSprite *s = &g_sprites[slot];
@@ -613,6 +776,7 @@ void far_0000_076F(CPU *cpu)
     cpu->ax = (uint16_t)(0x4000 | slot);  /* opaque host handle */
     { static int _g=0; if(++_g<=6) fprintf(stderr,"[SPRITE] grab slot=%d %dx%d @(%d,%d) pg%d\n",slot,width,height,gx,gy,page); }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_076F");
 }
 
 /* far_0000_083F - Sprite blitter (thunk; the long-stubbed keystone, 64 callers).
@@ -625,6 +789,8 @@ void far_0000_076F(CPU *cpu)
  * and skip. */
 void far_0000_083F(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_083F");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t sp = (uint16_t)(cpu->sp + 4);
     uint16_t gfx_ctx = mem_read16(cpu, cpu->ss, sp);
     int16_t  x       = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 2));
@@ -665,6 +831,7 @@ void far_0000_083F(CPU *cpu)
         }
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_083F");
 }
 
 /* ─── Story display bypass ─── */
@@ -673,9 +840,12 @@ void far_0000_083F(CPU *cpu)
  * display primitives (0856, 084F, 0848) are wrong, causing hangs. */
 void far_1FB6_044A(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_1FB6_044A");
+    RECOMP_SP_ENTRY(cpu);
     fprintf(stderr, "[BYPASS] far_1FB6_044A (story display) skipped\n");
     fflush(stderr);
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_1FB6_044A");
 }
 
 /* ─── Display: flush ─── */
@@ -683,6 +853,8 @@ void far_1FB6_044A(CPU *cpu)
  * DS:0xAA points to GFX struct; struct[+00] = page flag. */
 void far_085F_259C(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_085F_259C");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t gfx_ptr = mem_read16(cpu, cpu->ds, 0xAA);
     uint16_t page = mem_read16(cpu, cpu->ds, gfx_ptr); /* struct[+00] page flag */
     if (page != 0) {
@@ -692,6 +864,7 @@ void far_085F_259C(CPU *cpu)
         }
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_085F_259C");
 }
 
 /* ─── File I/O: _access() ─── */
@@ -700,6 +873,8 @@ void far_085F_259C(CPU *cpu)
  * Reads filename pointer from stack. */
 void far_0000_065C(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_065C");
+    RECOMP_SP_ENTRY(cpu);
     static int call_count = 0;
     call_count++;
     /* Stack: [ret_addr 4 bytes] [path_off 2 bytes] [mode 2 bytes] */
@@ -730,6 +905,7 @@ void far_0000_065C(CPU *cpu)
         fprintf(stderr, "[ACCESS] #%d off=%04X path='%s' result=%s\n",
                 call_count, path_off, native_path, f ? "EXISTS" : "NOT_FOUND");
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_065C");
 }
 
 /* ─── Graphics page-flip system ─── */
@@ -771,6 +947,8 @@ static uint32_t gfx_page_addr(uint16_t page)
  *   [bp+10] color    - palette index */
 void far_0000_0BEC(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_0BEC");
+    RECOMP_SP_ENTRY(cpu);
     static uint64_t call_count = 0;
     call_count++;
 
@@ -816,7 +994,7 @@ void far_0000_0BEC(CPU *cpu)
     /* Early out: nothing to draw */
     if (width <= 0 || height <= 0) {
         cpu->sp += 4; /* far ret */
-        return;
+        { RECOMP_CHECK_SP(cpu, "far_0000_0BEC"); return; }
     }
 
     /* Read GFX context struct from DS */
@@ -839,7 +1017,7 @@ void far_0000_0BEC(CPU *cpu)
     if (y2 > 200) y2 = 200;
     if (x1 >= x2 || y1 >= y2) {
         cpu->sp += 4; /* far ret */
-        return;
+        { RECOMP_CHECK_SP(cpu, "far_0000_0BEC"); return; }
     }
 
     /* Fill the rectangle */
@@ -850,6 +1028,7 @@ void far_0000_0BEC(CPU *cpu)
         }
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_0BEC");
 }
 
 /* ─── Blit: far_0000_07ED ─── */
@@ -871,6 +1050,8 @@ void far_0000_0BEC(CPU *cpu)
  */
 void far_0000_07ED(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_07ED");
+    RECOMP_SP_ENTRY(cpu);
     static uint64_t call_count = 0;
     call_count++;
 
@@ -901,7 +1082,7 @@ void far_0000_07ED(CPU *cpu)
 
     if (width <= 0 || height <= 0) {
         cpu->sp += 4; /* far ret */
-        return;
+        { RECOMP_CHECK_SP(cpu, "far_0000_07ED"); return; }
     }
 
     /* Read source GFX context */
@@ -943,7 +1124,7 @@ void far_0000_07ED(CPU *cpu)
 
     if (copy_w <= 0 || copy_h <= 0) {
         cpu->sp += 4; /* far ret */
-        return;
+        { RECOMP_CHECK_SP(cpu, "far_0000_07ED"); return; }
     }
 
     /* Copy scanlines */
@@ -956,6 +1137,7 @@ void far_0000_07ED(CPU *cpu)
     }
 
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_07ED");
 }
 
 /* ─── PIC row blitter: far_0000_07E6 ───
@@ -972,6 +1154,8 @@ void far_0000_07ED(CPU *cpu)
  *   [sp+0C] width    - pixels to copy */
 void far_0000_07E6(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_07E6");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t sp = (uint16_t)(cpu->sp + 4);
     uint16_t src_off = mem_read16(cpu, cpu->ss, sp);
     uint16_t dst_gfx = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 2));
@@ -1011,6 +1195,7 @@ void far_0000_07E6(CPU *cpu)
         }
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_07E6");
 }
 
 /* ─── Text: far_0000_07F4 - render a string to the active GFX page ───
@@ -1031,6 +1216,8 @@ void far_0000_07E6(CPU *cpu)
  * overlay existing graphics (matches the original's masked glyph blit). */
 void far_0000_07F4(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_07F4");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t sp = (uint16_t)(cpu->sp + 4); /* skip far return address */
     uint16_t gfx_ctx = mem_read16(cpu, cpu->ss, sp);
     int16_t  x       = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(sp + 2));
@@ -1067,6 +1254,7 @@ void far_0000_07F4(CPU *cpu)
         cx += 8;
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_07F4");
 }
 
 /* Forward decls for helpers called by the lifted ovl07_035B6E (defined later
@@ -1097,6 +1285,8 @@ extern void res_022418(CPU *cpu);
  * stubs and no-op harmlessly; they do not affect loop-termination counters. */
 void ovl07_035B6E(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "ovl07_035B6E");
+    RECOMP_SP_ENTRY(cpu);
     push16(cpu, cpu->bp);                    /* push bp */
     cpu->bp = (uint16_t)(cpu->sp);           /* mov bp, sp */
     cpu->sp = (uint16_t)(flags_sub16(cpu, cpu->sp, 0x1A)); /* sub sp, 0x1A */
@@ -1520,7 +1710,7 @@ L_ovl07_035B6E_00040E:;
 L_ovl07_035B6E_000410:;
     cpu->sp = (uint16_t)(cpu->bp);           /* mov sp, bp */
     cpu->bp = (uint16_t)(pop16(cpu));        /* pop bp */
-    cpu->sp += 4; return;                    /* retf */
+    cpu->sp += 4; { RECOMP_CHECK_SP(cpu, "ovl07_035B6E"); return; }                    /* retf */
 }
 
 /* ─── File read: far_205A_30E4 ─── */
@@ -1531,6 +1721,8 @@ L_ovl07_035B6E_000410:;
  * Returns AX = bytes read (or 0 on error). */
 void far_205A_30E4(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_205A_30E4");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t sp = (uint16_t)(cpu->sp + 4);
     uint16_t handle_or_fp = mem_read16(cpu, cpu->ss, sp);
     uint16_t buf_off   = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 2));
@@ -1552,12 +1744,30 @@ void far_205A_30E4(CPU *cpu)
         if (slot >= 0) {
             handle = g_civ_files[slot].dos_handle;
         } else {
-            /* Last resort: any open slot */
+            /* Last resort: the single open stream, if there is exactly one.
+             *
+             * This used to take the FIRST open slot unconditionally. After a
+             * failed open -- which is normal: the intro probes birth0..N and
+             * stops when a file is missing -- the token stops resolving and
+             * that handed the LZW decoder a DIFFERENT file's bytes. The reads
+             * all succeeded, so nothing looked wrong; the decoder simply never
+             * reached an end of stream and spun forever.
+             *
+             * With one stream open the substitution is unambiguous and keeps
+             * the PIC path working. With none or several, leave the handle
+             * unresolved so the read reports EOF and the caller can stop. */
+            int open_n = 0, open_slot = -1;
             for (int s = 0; s < CIV_FILE_MAX; s++) {
-                if (g_civ_files[s].in_use) {
-                    handle = g_civ_files[s].dos_handle;
-                    break;
-                }
+                if (g_civ_files[s].in_use) { open_n++; open_slot = s; }
+            }
+            if (open_n == 1) {
+                handle = g_civ_files[open_slot].dos_handle;
+            } else {
+                static int warned = 0;
+                if (!warned++)
+                    fprintf(stderr, "[READ] unresolved stream (%d open) -> EOF\n",
+                            open_n);
+                handle = 0xFF;   /* forces the EOF path below */
             }
         }
     }
@@ -1572,6 +1782,16 @@ void far_205A_30E4(CPU *cpu)
             got = (uint16_t)n;
             static int rc = 0; rc++;
             if (rc <= 8) fprintf(stderr, "[READ] h=%d %u bytes -> %zu\n", handle, size, n);
+            /* Is the spin re-reading one stream from the start, or consuming
+             * a stream that legitimately advances? Those need opposite fixes,
+             * so measure rather than guess: report the handle, the file offset
+             * BEFORE the read, and the running total, every 200th call. */
+            { static long calls = 0, total = 0;
+              long pos = ftell(dos->file_table.files[handle]);
+              calls++; total += (long)n;
+              if (calls <= 3 || (calls % 200) == 0)
+                  fprintf(stderr, "[RDPOS] call %ld h=%d pos_after=%ld got=%zu total=%ld\n",
+                          calls, handle, pos, n, total); }
         }
     } else {
         static int fc = 0; fc++;
@@ -1585,6 +1805,7 @@ void far_205A_30E4(CPU *cpu)
     mem_write16(cpu, cpu->ss, res_ptr, got);
     cpu->ax = got;
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_205A_30E4");
 }
 
 /* ─── MSC 5.x CRT text-stream chain (scanf %s/%[ field reader) ───────────────
@@ -1604,10 +1825,26 @@ void res_021C22(CPU *cpu);  void far_215A_16DA(CPU *cpu);
 /* getc: next byte from the FILE token at DS:[0x6AA0], or EOF (-1). */
 void res_021BC8(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_021BC8");
+    RECOMP_SP_ENTRY(cpu);
     mem_write16(cpu, cpu->ds, 0x6AB8,
                 (uint16_t)(mem_read16(cpu, cpu->ds, 0x6AB8) + 1)); /* inc char count */
     uint16_t tok = mem_read16(cpu, cpu->ds, 0x6AA0);
     int slot = civ_file_token_to_slot(tok);
+    /* The token is only ours when the hand-written fopen made it. A file the
+     * game opened through raw DOS carries a pointer to its own FILE struct
+     * instead, and this chain then returned EOF on the first call -- which is
+     * why intro.txt read 512 bytes and parsed to nothing. Dump the struct once
+     * so the layout comes from the running program, not from a guess. */
+    if (slot < 0) {
+        static int shown = 0;
+        if (!shown++) {
+            fprintf(stderr, "[FILEDIAG] unknown token %04X; DS:%04X =", tok, tok);
+            for (int b = 0; b < 16; b++)
+                fprintf(stderr, " %02X", mem_read8(cpu, cpu->ds, (uint16_t)(tok + b)));
+            fprintf(stderr, "\n");
+        }
+    }
     int c = -1;
     if (slot >= 0) {
         DosState *dos = get_dos_state(cpu);
@@ -1617,12 +1854,15 @@ void res_021BC8(CPU *cpu)
     }
     cpu->ax = (c < 0) ? 0xFFFF : (uint16_t)(c & 0xFF);
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "res_021BC8");
 }
 
 /* ungetc(char, FILE): push a char back onto the host stream. Args (cdecl):
  * [sp+4]=char, [sp+6]=FILE token. */
 void far_215A_16DA(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_215A_16DA");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t sp = (uint16_t)(cpu->sp + 4);
     int16_t  ch  = (int16_t)mem_read16(cpu, cpu->ss, sp);
     uint16_t tok = mem_read16(cpu, cpu->ss, (uint16_t)(sp + 2));
@@ -1635,11 +1875,14 @@ void far_215A_16DA(CPU *cpu)
     }
     cpu->ax = (uint16_t)(ch & 0xFF);
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_215A_16DA");
 }
 
 /* field-width check: AX=1 if more chars allowed, 0 if width exhausted. */
 void res_021C22(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_021C22");
+    RECOMP_SP_ENTRY(cpu);
     if (mem_read16(cpu, cpu->ds, 0x6AB0) == 0) {
         cpu->ax = 1;
     } else if ((int16_t)mem_read16(cpu, cpu->ds, 0x6AB2) > 0) {
@@ -1650,11 +1893,14 @@ void res_021C22(CPU *cpu)
         cpu->ax = 0;
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "res_021C22");
 }
 
 /* skip leading whitespace, peek the next char, push it back (ungetc). */
 void res_021BEC(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_021BEC");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t si;
 L_loop:
     push16(cpu, cpu->cs); push16(cpu, 0); res_021BC8(cpu);   /* getc */
@@ -1673,6 +1919,7 @@ L_loop:
     }
     cpu->ax = si;
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "res_021BEC");
 }
 
 /* scanf field reader: reads a whitespace/scanset-delimited field into the
@@ -1680,6 +1927,8 @@ L_loop:
  * port of the 0x2178A routine. Arg [sp+4] = store-result flag. */
 void res_02178A(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_02178A");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t arg = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
     uint16_t bx  = mem_read16(cpu, cpu->ds, 0x6AAC);
     uint16_t si  = mem_read16(cpu, cpu->ds, bx);   /* dest buffer pos */
@@ -1746,6 +1995,7 @@ L2185c:
                     (uint16_t)(mem_read16(cpu, cpu->ds, 0x6AB6) + 1));
 Lcleanup:
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "res_02178A");
 }
 
 /* ─── Climate/temperature: far_205A_2AC0 ─── */
@@ -1755,10 +2005,13 @@ Lcleanup:
  * Returns AX = abs(latitude). */
 void far_205A_2AC0(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_205A_2AC0");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t sp = (uint16_t)(cpu->sp + 4);
     int16_t arg = (int16_t)mem_read16(cpu, cpu->ss, sp);
     cpu->ax = (uint16_t)(arg < 0 ? -arg : arg);
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_205A_2AC0");
 }
 
 /* ─── Timer delay: far_1DDE_007C ─── */
@@ -1779,6 +2032,8 @@ void far_205A_2AC0(CPU *cpu)
  * correct clamp yields a small next-step target so the reveal advances. */
 void far_1DDE_007C(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_1DDE_007C");
+    RECOMP_SP_ENTRY(cpu);
     int16_t value = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
     int16_t lo    = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 6));
     int16_t hi    = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 8));
@@ -1786,14 +2041,18 @@ void far_1DDE_007C(CPU *cpu)
     if (value > hi) value = hi;
     cpu->ax = (uint16_t)value;
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_1DDE_007C");
 }
 
 /* ─── Signal handlers ─── */
 /* res_001E52 - MSC signal handler setup (safe no-op). */
 void res_001E52(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_001E52");
+    RECOMP_SP_ENTRY(cpu);
     (void)cpu;
     cpu->sp += 2; /* near ret */
+    RECOMP_CHECK_SP(cpu, "res_001E52");
 }
 
 /* ─── MSC CRT: _aFchkstk (far stack check) ─── */
@@ -1803,6 +2062,8 @@ void res_001E52(CPU *cpu)
  * NOT an allocator - just checks available space. We always report plenty. */
 void far_205A_1B8C(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_205A_1B8C");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t ret_ip = pop16(cpu);
     uint16_t ret_cs = pop16(cpu);
     uint16_t limit = mem_read16(cpu, cpu->ds, 0x58EA);
@@ -1818,6 +2079,7 @@ void far_205A_1B8C(CPU *cpu)
     push16(cpu, ret_cs);
     push16(cpu, ret_ip);
     cpu->sp += 4; /* retf */
+    RECOMP_CHECK_SP(cpu, "far_205A_1B8C");
 }
 
 /* ─── MSC CRT: res_0207C7 (near stack helper) ─── */
@@ -1825,7 +2087,10 @@ void far_205A_1B8C(CPU *cpu)
  * This is a mid-function entry point - just return cleanly. */
 void res_0207C7(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_0207C7");
+    RECOMP_SP_ENTRY(cpu);
     cpu->sp += 2; /* near ret */
+    RECOMP_CHECK_SP(cpu, "res_0207C7");
 }
 
 /* ─── MSC CRT: res_0220AA (buffer write/flush) ─── */
@@ -1834,6 +2099,8 @@ void res_0207C7(CPU *cpu)
  * Original: PUSH AX/BX/CX; CX = DI-DX (bytes); INT 21h/AH=40h (write);
  *           ADD [BP-2],AX (count); POP CX/BX/AX; DI=DX (reset). */
 void res_0220AA(CPU *cpu) {
+    RECOMP_TRACE(cpu, "res_0220AA");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t saved_ax = cpu->ax;
     uint16_t saved_bx = cpu->bx;
     uint16_t saved_cx = cpu->cx;
@@ -1841,7 +2108,7 @@ void res_0220AA(CPU *cpu) {
     uint16_t count = (uint16_t)(cpu->di - cpu->dx); /* bytes to write */
     if (count == 0) {
         cpu->sp += 2; /* near ret */
-        return;
+        { RECOMP_CHECK_SP(cpu, "res_0220AA"); return; }
     }
 
     /* Call DOS write: AH=40h, BX=handle from [BP+6], CX=count, DS:DX=buffer */
@@ -1866,6 +2133,7 @@ void res_0220AA(CPU *cpu) {
     cpu->ax = saved_ax;
 
     cpu->sp += 2; /* near ret */
+    RECOMP_CHECK_SP(cpu, "res_0220AA");
 }
 
 /* ─── Page/cursor control ─── */
@@ -1875,8 +2143,11 @@ void res_0220AA(CPU *cpu) {
  * The game code sets struct[+00] directly, so this is a safe no-op. */
 void far_0000_0838(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_0838");
+    RECOMP_SP_ENTRY(cpu);
     (void)cpu;
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_0838");
 }
 
 /* Timer speed multiplier - speeds up animation during world gen */
@@ -1890,6 +2161,8 @@ static int timer_speed = 20;
 static uint32_t delay_start_ticks = 0;
 void far_0000_0330(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_0330");
+    RECOMP_SP_ENTRY(cpu);
     static int call_count = 0;
     call_count++;
 
@@ -1905,6 +2178,7 @@ void far_0000_0330(CPU *cpu)
         fflush(stderr);
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_0330");
 }
 
 /* far_0000_032C - Read elapsed ticks since last far_0000_0330 call.
@@ -1912,6 +2186,8 @@ void far_0000_0330(CPU *cpu)
  * Also pumps SDL events so the window stays responsive during delays. */
 void far_0000_032C(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_032C");
+    RECOMP_SP_ENTRY(cpu);
     static uint64_t call_count = 0;
     call_count++;
 
@@ -1935,6 +2211,7 @@ void far_0000_032C(CPU *cpu)
         fflush(stderr);
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_032C");
 }
 
 /* ─── Timer read ─── */
@@ -1945,6 +2222,8 @@ void far_0000_032C(CPU *cpu)
  * periodically pump SDL events to keep the window responsive. */
 void far_0000_0A40(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_0A40");
+    RECOMP_SP_ENTRY(cpu);
     DosState *dos = get_dos_state(cpu);
 
     /* Update timer from wall-clock time (scaled by speed multiplier) */
@@ -1966,6 +2245,7 @@ void far_0000_0A40(CPU *cpu)
     }
 
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_0A40");
 }
 
 /* ─── Timer/event yield ─── */
@@ -1979,6 +2259,8 @@ void far_0000_0A40(CPU *cpu)
  * Without this, the SDL window freezes during non-I/O game logic. */
 void far_0402_44E9(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0402_44E9");
+    RECOMP_SP_ENTRY(cpu);
     static uint64_t call_count = 0;
     call_count++;
 
@@ -2008,6 +2290,7 @@ void far_0402_44E9(CPU *cpu)
 
     cpu->sp += 4; /* far ret */
     fprintf(stderr, "[YIELD] RETURNING sp=%04X\n", cpu->sp); fflush(stderr);
+    RECOMP_CHECK_SP(cpu, "far_0402_44E9");
 }
 
 /* ─── res_02120A: MSC _getbuf (un-stubbed 2026-05-31, task #7) ───
@@ -2020,6 +2303,8 @@ void far_0402_44E9(CPU *cpu)
 void res_022138(CPU *cpu);  /* MSC malloc/_getbuf-core (far), civ_recomp_006.c */
 void res_02120A(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_02120A");
+    RECOMP_SP_ENTRY(cpu);
     push16(cpu, cpu->bp);                    /* push bp */
     cpu->bp = (uint16_t)(cpu->sp);           /* mov bp, sp */
     cpu->sp = (uint16_t)(flags_sub16(cpu, cpu->sp, 0x2)); /* sub sp, 0x2 */
@@ -2064,7 +2349,7 @@ L_res_02120A_00005A:;
     cpu->si = (uint16_t)(pop16(cpu));        /* pop si */
     cpu->sp = (uint16_t)(cpu->bp);           /* mov sp, bp */
     cpu->bp = (uint16_t)(pop16(cpu));        /* pop bp */
-    cpu->sp += 2; return;                    /* ret */
+    cpu->sp += 2; { RECOMP_CHECK_SP(cpu, "res_02120A"); return; }                    /* ret */
 }
 
 /* ─── Traced alias wrappers ─── */
@@ -2083,8 +2368,11 @@ void ovl02_02C200(CPU *cpu);  /* forward decl - defined below */
  * free-memory figure (>= the 0x1F40 graphics threshold) to skip LOMEM. */
 void far_0000_0768(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_0768");
+    RECOMP_SP_ENTRY(cpu);
     cpu->ax = 0x6000;   /* plenty of free memory; skip *LOMEM warning */
     cpu->sp += 4;       /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_0768");
 }
 
 /* far_0000_0792 - Alias for ovl03_02DED7 (civ info screen).
@@ -2093,24 +2381,33 @@ void far_0000_0768(CPU *cpu)
  * returns AX=1 if user pressed 'c', 0 otherwise. We return 0 (skip). */
 void far_0000_0792(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_0792");
+    RECOMP_SP_ENTRY(cpu);
     fprintf(stderr, "[BYPASS] far_0000_0792 (civ info screen) skipped\n");
     fflush(stderr);
     cpu->ax = 0;  /* no 'c' pressed */
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_0792");
 }
 
 /* far_0000_07DF - Alias for ovl05_0307DA (was incorrectly mapped to ovl05_030C49) */
 extern void ovl05_0307DA(CPU *cpu);
 void far_0000_07DF(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_07DF");
+    RECOMP_SP_ENTRY(cpu);
     ovl05_0307DA(cpu);
+    RECOMP_CHECK_SP(cpu, "far_0000_07DF");
 }
 
 /* far_0000_0761 - Alias for ovl01_02BA00 (intro function) */
 void ovl01_02BA00(CPU *cpu);  /* forward decl - defined below */
 void far_0000_0761(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_0761");
+    RECOMP_SP_ENTRY(cpu);
     ovl01_02BA00(cpu);
+    RECOMP_CHECK_SP(cpu, "far_0000_0761");
 }
 
 /* ─── Mega-function mid-entry ─── */
@@ -2120,6 +2417,8 @@ void far_0000_0761(CPU *cpu)
  * In our recomp, SDL handles display - just decrement ref count. */
 void res_001CC6(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_001CC6");
+    RECOMP_SP_ENTRY(cpu);
     /* Match the original: if VGA flag set and ref_count == 1, decrement */
     uint16_t vga_flag = mem_read16(cpu, cpu->ds, 0x1A3C);
     uint16_t ref_count = mem_read16(cpu, cpu->ds, 0xEE1A);
@@ -2129,6 +2428,7 @@ void res_001CC6(CPU *cpu)
         mem_write16(cpu, cpu->ds, 0xEE1A, (uint16_t)(ref_count - 1));
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "res_001CC6");
 }
 
 /* res_001CAE - VGA mode set (mid-entry in res_001C20 at offset 0x8E).
@@ -2136,6 +2436,8 @@ void res_001CC6(CPU *cpu)
  * calls far_0000_16CD to set VGA mode 13h. */
 void res_001CAE(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_001CAE");
+    RECOMP_SP_ENTRY(cpu);
     /* inc word ds:[0xEE1A] */
     uint16_t ref_count = mem_read16(cpu, cpu->ds, 0xEE1A);
     ref_count++;
@@ -2151,6 +2453,7 @@ void res_001CAE(CPU *cpu)
         bios_int10(cpu);
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "res_001CAE");
 }
 
 /* ─── Keyboard input availability check ─── */
@@ -2160,6 +2463,8 @@ void res_001CAE(CPU *cpu)
  * Returns AX=1 if character available, AX=0 if not. Far return. */
 void res_021C08(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_021C08");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t buf_flag = mem_read16(cpu, cpu->ds, 0x6AB0);
     if (buf_flag == 0) {
         /* No unget buffer - character available (from DOS kbhit) */
@@ -2180,6 +2485,7 @@ void res_021C08(CPU *cpu)
     else
         cpu->flags &= ~FLAG_ZF;
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "res_021C08");
 }
 
 /* ─── Heap segment allocation ─── */
@@ -2189,10 +2495,12 @@ void res_021C08(CPU *cpu)
  * On success: DX != 0xFFFF, ZF clear.
  * On failure: DX = 0xFFFF, ZF set. */
 /* Near heap break pointer - starts at BSS end */
-static uint16_t heap_break = 0xF7F0;
+static uint16_t heap_break = CIV_FILE_AREA_END;  /* FILE structs sit below this */
 
 void res_0222C0(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_0222C0");
+    RECOMP_SP_ENTRY(cpu);
     /* The original _nheapgrow: extends the near heap by AX paragraphs.
      * Returns AX = DS offset of new memory, ZF clear on success.
      * Checks against stack pointer to prevent collision. */
@@ -2208,7 +2516,7 @@ void res_0222C0(CPU *cpu)
         cpu->dx = 0xFFFF; /* failure */
         cpu->flags |= FLAG_ZF;
         cpu->sp += 2; /* near ret */
-        return;
+        { RECOMP_CHECK_SP(cpu, "res_0222C0"); return; }
     }
 
     uint16_t result = heap_break;
@@ -2221,6 +2529,7 @@ void res_0222C0(CPU *cpu)
     cpu->dx = result; /* caller expects DX != 0xFFFF on success */
     cpu->flags &= ~FLAG_ZF; /* success */
     cpu->sp += 2; /* near ret */
+    RECOMP_CHECK_SP(cpu, "res_0222C0");
 }
 
 /* ─── Turn year display ─── */
@@ -2229,6 +2538,8 @@ void res_0222C0(CPU *cpu)
  * This is a mid-function entry point. */
 void far_0237_171C(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0237_171C");
+    RECOMP_SP_ENTRY(cpu);
     int16_t year = (int16_t)mem_read16(cpu, cpu->ds, 0xC150);
 
     /* Format: number + "BC"/"AD" appended to buffer at DS:0xC936 */
@@ -2274,6 +2585,7 @@ void far_0237_171C(CPU *cpu)
     mem_write8(cpu, cpu->ds, (uint16_t)(buf_off + pos), 0);
 
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0237_171C");
 }
 
 /* ─── Heap manager mid-entries ─── */
@@ -2299,6 +2611,8 @@ static int heap_chain_fixed = 0;
 
 void res_022181(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_022181");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t requested = cpu->cx;
     if (requested == 0) requested = 2;
     /* Match MSC convention: inc cx; and cl, 0xFE */
@@ -2379,7 +2693,7 @@ void res_022181(CPU *cpu)
                     cpu->dx = cpu->ds;
                     cpu->flags &= ~FLAG_ZF;
                     cpu->sp += 2;
-                    return;
+                    { RECOMP_CHECK_SP(cpu, "res_022181"); return; }
                 }
             }
             pos = HEAP_NEXT(pos, hdr);
@@ -2400,7 +2714,7 @@ void res_022181(CPU *cpu)
             cpu->ax = 0; cpu->dx = 0; cpu->flags |= FLAG_ZF;
             uint16_t h = mem_read16(cpu, cpu->ds, cpu->bx);
             mem_write16(cpu, cpu->ds, (uint16_t)(cpu->bx + 2), h);
-            cpu->sp += 2; return;
+            cpu->sp += 2; { RECOMP_CHECK_SP(cpu, "res_022181"); return; }
         }
         cpu->ax = save_ax;
         alloc_end = heap_break + block_total;
@@ -2409,7 +2723,7 @@ void res_022181(CPU *cpu)
             cpu->ax = 0; cpu->dx = 0; cpu->flags |= FLAG_ZF;
             uint16_t h = mem_read16(cpu, cpu->ds, cpu->bx);
             mem_write16(cpu, cpu->ds, (uint16_t)(cpu->bx + 2), h);
-            cpu->sp += 2; return;
+            cpu->sp += 2; { RECOMP_CHECK_SP(cpu, "res_022181"); return; }
         }
     }
 
@@ -2427,6 +2741,7 @@ void res_022181(CPU *cpu)
     cpu->dx = cpu->ds;
     cpu->flags &= ~FLAG_ZF;
     cpu->sp += 2;
+    RECOMP_CHECK_SP(cpu, "res_022181");
 }
 
 /* ─── Overlay manager init: res_000A54 ─── */
@@ -2443,6 +2758,8 @@ void res_022181(CPU *cpu)
  */
 void res_000A54(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_000A54");
+    RECOMP_SP_ENTRY(cpu);
     /* Query available DOS memory */
     cpu->ah = 0x48;
     cpu->bx = 0xFFFF;
@@ -2473,6 +2790,7 @@ void res_000A54(CPU *cpu)
 
     cpu->ax = seg;
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "res_000A54");
 }
 
 /* ─── Overlay thunk table init: res_000B4E ─── */
@@ -2484,9 +2802,12 @@ void res_000A54(CPU *cpu)
  */
 void res_000B4E(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_000B4E");
+    RECOMP_SP_ENTRY(cpu);
     (void)cpu;
     fprintf(stderr, "[RUNTIME] res_000B4E (thunk table init) - skipped\n");
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "res_000B4E");
 }
 
 /* ─── Overlay file loader ─── */
@@ -2495,10 +2816,13 @@ void res_000B4E(CPU *cpu)
  * In our recompilation, all overlay code is already compiled in. */
 void res_000AFC(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_000AFC");
+    RECOMP_SP_ENTRY(cpu);
     (void)cpu;
     static int _warned = 0;
     if (!_warned) { fprintf(stderr, "[RUNTIME] res_000AFC (overlay file loader) called\n"); _warned = 1; }
     cpu->sp += 2; /* near ret */
+    RECOMP_CHECK_SP(cpu, "res_000AFC");
 }
 
 /* ─── DOS EXEC ─── */
@@ -2507,10 +2831,13 @@ void res_000AFC(CPU *cpu)
  * In our recompilation, this is a no-op. */
 void res_000B98(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_000B98");
+    RECOMP_SP_ENTRY(cpu);
     (void)cpu;
     static int _warned = 0;
     if (!_warned) { fprintf(stderr, "[RUNTIME] res_000B98 (DOS EXEC) called - skipping\n"); _warned = 1; }
     cpu->sp += 2; /* near ret */
+    RECOMP_CHECK_SP(cpu, "res_000B98");
 }
 
 /* ─── MSC CRT: strcpy ─── */
@@ -2519,6 +2846,8 @@ void res_000B98(CPU *cpu)
  * Caller cleans up 4 bytes of args (cdecl). Returns dest in AX. */
 void far_205A_1E60(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_205A_1E60");
+    RECOMP_SP_ENTRY(cpu);
     /* Stack: [ret_addr 4 bytes] [dest_off 2] [src_off 2] */
     uint16_t dest_off = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
     uint16_t src_off  = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 6));
@@ -2533,6 +2862,7 @@ void far_205A_1E60(CPU *cpu)
 
     cpu->ax = dest_off;  /* Return pointer to dest */
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_205A_1E60");
 }
 
 /* ─── Read character from input ─── */
@@ -2541,6 +2871,8 @@ void far_205A_1E60(CPU *cpu)
  * Blocks until input available, pumps SDL event loop. */
 void far_0000_09E5(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_09E5");
+    RECOMP_SP_ENTRY(cpu);
     static int call_count = 0;
     call_count++;
     DosState *dos = get_dos_state(cpu);
@@ -2577,6 +2909,7 @@ void far_0000_09E5(CPU *cpu)
     fprintf(stderr, "[KEY] far_0000_09E5 #%d: 0x%04X (ascii='%c')\n",
             call_count, key, (cpu->al >= 32 && cpu->al < 127) ? cpu->al : '.');
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_09E5");
 }
 
 /* ─── MSC CRT: __chkstk ─── */
@@ -2587,11 +2920,14 @@ void far_0000_09E5(CPU *cpu)
  * Net effect: SP = SP_before_call - AX. */
 void far_205A_0264(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_205A_0264");
+    RECOMP_SP_ENTRY(cpu);
     /* SP currently = original_SP - 4 (from simulated far return addr push).
      * We need SP = original_SP - AX after returning.
      * The +4 undoes the return addr push, -AX allocates locals.
      * No additional sp += 4 needed since we already account for it. */
     cpu->sp = (uint16_t)(cpu->sp + 4 - cpu->ax);
+    RECOMP_CHECK_SP(cpu, "far_205A_0264");
 }
 
 /* ─── Dialog/message box ─── */
@@ -2607,6 +2943,8 @@ void far_205A_0264(CPU *cpu)
  * The caller reads the result from the 2 bytes before ctrl_off. */
 void far_205A_20C2(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_205A_20C2");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t type     = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
     uint16_t ctrl_off = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 6));
     uint16_t text_off = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 8));
@@ -2666,6 +3004,7 @@ void far_205A_20C2(CPU *cpu)
     }
 
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_205A_20C2");
 }
 
 /* ─── Reference counter increment ─── */
@@ -2674,10 +3013,13 @@ void far_205A_20C2(CPU *cpu)
  * Increments the 16-bit word at DS:[param]. */
 void res_0311F0(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_0311F0");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t ptr = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 2));
     uint16_t val = mem_read16(cpu, cpu->ds, ptr);
     mem_write16(cpu, cpu->ds, ptr, (uint16_t)(val + 1));
     cpu->sp += 2; /* near ret */
+    RECOMP_CHECK_SP(cpu, "res_0311F0");
 }
 
 /* ─── MSC CRT: memcpy ─── */
@@ -2686,6 +3028,8 @@ void res_0311F0(CPU *cpu)
  * Copies count bytes from DS:src to DS:dest. Returns dest in AX. */
 void far_205A_2A06(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_205A_2A06");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t dest  = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
     uint16_t src   = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 6));
     uint16_t count = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 8));
@@ -2698,6 +3042,7 @@ void far_205A_2A06(CPU *cpu)
 
     cpu->ax = dest;  /* Return dest pointer */
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_205A_2A06");
 }
 
 /* ─── VGA detection ─── */
@@ -2707,9 +3052,12 @@ void far_205A_2A06(CPU *cpu)
  * If this returns 0, the game skips VGA mode 13h setup entirely. */
 void far_0000_1630(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_1630");
+    RECOMP_SP_ENTRY(cpu);
     fprintf(stderr, "[VGA] far_0000_1630: VGA detection -> returning 1 (present)\n");
     cpu->ax = 1;  /* VGA is present */
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_1630");
 }
 
 /* ─── Intro bypass ─── */
@@ -2722,12 +3070,29 @@ void far_0000_1630(CPU *cpu)
  * prevent intro.txt from being read correctly. Rather than fix the entire
  * MSC 5.x CRT I/O chain, we bypass the intro and set config directly.
  *
+ * UN-BYPASS ATTEMPT (2026-09-10). The real overlay-1 entry lifts and runs.
+ * Established, so nobody re-derives it:
+ *   - intro.txt opens (raw DOS open, handle 5), 512 bytes read into a
+ *     512+2 heap buffer at DS:0xF842, bytes byte-exact vs the file.
+ *   - the CRT getc chain (res_021BC8) is NOT on this path; it never runs.
+ *   - the first dialog is type=16 opts=3 ctrl=0x672C; every dialog after
+ *     the read is opts=0, so the parse of that buffer yields no options
+ *     and the screen loops on "Press Space to continue..." forever.
+ *   - only 512 of the file 965 bytes are ever read: it gives up early.
+ * So the remaining bug is whatever walks DS:0xF842 and fills the dialog
+ * option count -- not the open, and not the read.
+ *
+ * Re-enabling it needs recomp.py to emit the lifted body under an alias
+ * so a hand-written wrapper can pick between them at runtime.
+ *
  * Config variables set:
  *   DS:0x1A30 - Sound driver selection (0 = no sound)
  *   DS:0x1A3C - VGA flag (1 = VGA present, use mode 13h)
  */
 void ovl01_02BA00(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "ovl01_02BA00");
+    RECOMP_SP_ENTRY(cpu);
     fprintf(stderr, "[INTRO] Bypassing intro screen (VGA=1, sound=none) DS=%04X\n",
             cpu->ds);
 
@@ -2761,6 +3126,7 @@ void ovl01_02BA00(CPU *cpu)
     }
 
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "ovl01_02BA00");
 }
 
 /* ─── CRT itoa replacement ─── */
@@ -2782,6 +3148,8 @@ void ovl01_02BA00(CPU *cpu)
  */
 void res_0224EE(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_0224EE");
+    RECOMP_SP_ENTRY(cpu);
     /* Read arguments from stack (far call: bp not yet pushed, args at sp+4) */
     int16_t value = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
     uint16_t buf_off = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 6));
@@ -2793,7 +3161,7 @@ void res_0224EE(CPU *cpu)
         cpu->mem[buf_flat] = 0;
         cpu->ax = buf_off;
         cpu->sp += 4; /* far ret */
-        return;
+        { RECOMP_CHECK_SP(cpu, "res_0224EE"); return; }
     }
 
     /* Convert integer to string */
@@ -2825,6 +3193,7 @@ void res_0224EE(CPU *cpu)
 
     cpu->ax = buf_off;
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "res_0224EE");
 }
 
 /* ─── Title screen bypass ─── */
@@ -2878,6 +3247,8 @@ extern void res_022418(CPU *cpu);
 
 void ovl02_02C200(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "ovl02_02C200");
+    RECOMP_SP_ENTRY(cpu);
     push16(cpu, cpu->bp);                    /* push bp */
     cpu->bp = (uint16_t)(cpu->sp);           /* mov bp, sp */
     cpu->sp = (uint16_t)(flags_sub16(cpu, cpu->sp, 0x4E)); /* sub sp, 0x4E */
@@ -4016,6 +4387,8 @@ L_ovl02_02C200_0009D7:;
     mem_write16(cpu, cpu->ds, 0x6AC2, (uint16_t)(0xFFFF)); /* mov word ds:[0x6AC2], 0xFFFF */
     push16(cpu, cpu->cs); push16(cpu, 0);    /* far call return addr */
     far_1D1F_0AC9(cpu);                      /* call 1D1F:0AC9 */
+    { static int n = 0;
+      if (n++ < 12) fprintf(stderr, "[MENUKEY] getkey -> AX=%04X\n", cpu->ax); }
     flags_cmp16(cpu, cpu->ax, 0x4E);         /* cmp ax, 0x4E */
     if (cc_e(cpu)) goto L_ovl02_02C200_000A09; /* je 0x0A09 */
     if (cc_g(cpu)) goto L_ovl02_02C200_000A3D; /* jg 0x0A3D */
@@ -4027,6 +4400,7 @@ L_ovl02_02C200_0009D7:;
     if (cc_e(cpu)) goto L_ovl02_02C200_000A25; /* je 0x0A25 */
     goto L_ovl02_02C200_000A0F;              /* jmp 0x0A0F */
 L_ovl02_02C200_000A09:;
+    fprintf(stderr, "[MENUSEL] New Game chosen (ds:6AC2 <- 0)\n");
     mem_write16(cpu, cpu->ds, 0x6AC2, (uint16_t)(0x0)); /* mov word ds:[0x6AC2], 0x0 */
 L_ovl02_02C200_000A0F:;
     flags_cmp16(cpu, mem_read16(cpu, cpu->ds, 0x6AC2), 0xFFFE); /* cmp word ds:[0x6AC2], 0xFFFE */
@@ -4223,7 +4597,7 @@ L_ovl02_02C200_000B52:;
     cpu->si = (uint16_t)(pop16(cpu));        /* pop si */
     cpu->sp = (uint16_t)(cpu->bp);           /* mov sp, bp */
     cpu->bp = (uint16_t)(pop16(cpu));        /* pop bp */
-    cpu->sp += 4; return;                    /* retf */
+    cpu->sp += 4; { RECOMP_CHECK_SP(cpu, "ovl02_02C200"); return; }                    /* retf */
 }
 
 /* ─── Random number module (overlay segment 0x1DDE) ─── */
@@ -4249,11 +4623,14 @@ static uint16_t civ_rand(void)
  * Stack: [ret4] [seed 2 bytes] */
 void far_1DDE_0042(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_1DDE_0042");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t seed = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
     rng_seed = (uint32_t)seed;
     rng_seeded = 1;
     fprintf(stderr, "[RNG] srand(%u)\n", seed);
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_1DDE_0042");
 }
 
 /* far_1DDE_005D - random(max): Return random int in [0, max).
@@ -4261,6 +4638,8 @@ void far_1DDE_0042(CPU *cpu)
  * Returns: AX = random value in [0, max) */
 void far_1DDE_005D(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_1DDE_005D");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t max_val = mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
     if (max_val == 0) {
         cpu->ax = 0;
@@ -4268,6 +4647,7 @@ void far_1DDE_005D(CPU *cpu)
         cpu->ax = civ_rand() % max_val;
     }
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_1DDE_005D");
 }
 
 /* ─── Map access thunks (overlay segment 0x1B05 / thunk 0x07C3) ─── */
@@ -4281,6 +4661,8 @@ void far_1DDE_005D(CPU *cpu)
  * organized by layer. Return the byte from the map data array. */
 void far_0000_07C3(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_0000_07C3");
+    RECOMP_SP_ENTRY(cpu);
     static int call_count = 0;
     call_count++;
 
@@ -4322,6 +4704,7 @@ void far_0000_07C3(CPU *cpu)
     }
 
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_0000_07C3");
 }
 
 /* res_01DE5C - integer clamp (lifted from dump @0x1DE5C). FAR function, invoked
@@ -4333,6 +4716,8 @@ void far_0000_07C3(CPU *cpu)
  * the degenerate 0x0 blit and corrupted the caller's stack frame. */
 void res_01DE5C(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_01DE5C");
+    RECOMP_SP_ENTRY(cpu);
     int16_t value = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 4));
     int16_t lo    = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 6));
     int16_t hi    = (int16_t)mem_read16(cpu, cpu->ss, (uint16_t)(cpu->sp + 8));
@@ -4340,6 +4725,7 @@ void res_01DE5C(CPU *cpu)
     if (value > hi) value = hi;
     cpu->ax = (uint16_t)value;
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "res_01DE5C");
 }
 
 /* far_1B05_17C3 - Map terrain write.
@@ -4347,6 +4733,8 @@ void res_01DE5C(CPU *cpu)
  * Writes a value to the map at given coordinates and layer. */
 void far_1B05_17C3(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "far_1B05_17C3");
+    RECOMP_SP_ENTRY(cpu);
     static int call_count = 0;
     call_count++;
 
@@ -4383,6 +4771,7 @@ void far_1B05_17C3(CPU *cpu)
     }
 
     cpu->sp += 4; /* far ret */
+    RECOMP_CHECK_SP(cpu, "far_1B05_17C3");
 }
 
 /* ─── PIC LZW Decoder: internal subroutines of res_0011E6 ─── */
@@ -4510,6 +4899,8 @@ static void lzw_dict_reset(CPU *cpu)
  * Near call (sp += 2 on return). */
 void res_00124E(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_00124E");
+    RECOMP_SP_ENTRY(cpu);
     /* Read new LZW parameters */
     if (cpu->si >= mem_read16(cpu, cpu->ds, 0x54D8))
         pic_refill_buffer(cpu);
@@ -4522,16 +4913,19 @@ void res_00124E(CPU *cpu)
     mem_write8(cpu, cpu->ds, 0x6888, 0x8);
     lzw_dict_reset(cpu);
     cpu->sp += 2; /* near ret */
+    RECOMP_CHECK_SP(cpu, "res_00124E");
 }
 
 /* res_001205 - Initialize LZW decoder state.
  * Near call (sp += 2 on return). */
 void res_001205(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_001205");
+    RECOMP_SP_ENTRY(cpu);
     uint16_t w = mem_read16(cpu, cpu->ds, 0x6874);
     uint16_t h = mem_read16(cpu, cpu->ds, 0x6876);
     if ((w | h) == 0) {
-        cpu->sp += 2; return;
+        cpu->sp += 2; { RECOMP_CHECK_SP(cpu, "res_001205"); return; }
     }
     /* Initialize RLE state */
     mem_write8(cpu, cpu->ds, 0x687E, 0x0);
@@ -4543,6 +4937,7 @@ void res_001205(CPU *cpu)
     push16(cpu, 0);
     res_00124E(cpu);
     cpu->sp += 2; /* near ret */
+    RECOMP_CHECK_SP(cpu, "res_001205");
 }
 
 /* res_0012F6 - LZW decode: return next decompressed byte.
@@ -4557,6 +4952,16 @@ void res_001205(CPU *cpu)
  * Near call (sp += 2 on return). */
 void res_0012F6(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_0012F6");
+    RECOMP_SP_ENTRY(cpu);
+    /* Is the decoder advancing, or chewing the same state?
+     * 0xC19E is the input pointer, 0x688A the previous code, 0x6A8D the
+     * decode stack base. If these repeat, it is looping on one input. */
+    { static long n = 0;
+      if ((++n % 20000) == 0)
+          fprintf(stderr, "[LZW] call %ld inptr=%04X prev=%04X stk=%04X tok=%04X\n",
+                  n, mem_read16(cpu, cpu->ds, 0xC19E), mem_read16(cpu, cpu->ds, 0x688A),
+                  mem_read16(cpu, cpu->ds, 0x6A8D), mem_read16(cpu, cpu->ds, 0x686C)); }
     /* Dictionary layout: 3 bytes per entry at DS:[entry*3 - 0x36CA]
      *   word: parent code (0xFFFF = root/single-byte)
      *   byte: character value
@@ -4572,7 +4977,7 @@ void res_0012F6(CPU *cpu)
         decode_sp += 2;  /* stack grows down, pop = sp += 2 (word-sized) */
         mem_write16(cpu, cpu->ds, 0x687A, decode_sp);
         cpu->sp += 2; /* near ret */
-        return;
+        { RECOMP_CHECK_SP(cpu, "res_0012F6"); return; }
     }
 
     /* Decode stack empty - need to decode next LZW code */
@@ -4670,6 +5075,7 @@ void res_0012F6(CPU *cpu)
     mem_write16(cpu, cpu->ds, 0x687A, decode_sp);
 
     cpu->sp += 2; /* near ret */
+    RECOMP_CHECK_SP(cpu, "res_0012F6");
 }
 
 /* res_001284 - Decode one row of PIC data (RLE + LZW).
@@ -4680,6 +5086,8 @@ void res_0012F6(CPU *cpu)
  * Near call (sp += 2 on return). */
 void res_001284(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_001284");
+    RECOMP_SP_ENTRY(cpu);
     uint8_t is_4bit = mem_read8(cpu, cpu->ds, 0x6889);
 
     /* Adjust pixel count for 4-bit mode */
@@ -4740,6 +5148,7 @@ void res_001284(CPU *cpu)
     }
 
     cpu->sp += 2; /* near ret */
+    RECOMP_CHECK_SP(cpu, "res_001284");
 }
 
 /* ─── Resident PIC decoder aliases (the dump-lifted copy the runtime actually
@@ -4773,6 +5182,8 @@ void res_01DBF5(CPU *cpu);
  */
 void res_01D665(CPU *cpu)
 {
+    RECOMP_TRACE(cpu, "res_01D665");
+    RECOMP_SP_ENTRY(cpu);
     push16(cpu, cpu->bp);                    /* push bp */
     cpu->bp = (uint16_t)(cpu->sp);           /* mov bp, sp */
     cpu->sp = (uint16_t)(flags_sub16(cpu, cpu->sp, 0x5C)); /* sub sp, 0x5C */
@@ -5300,5 +5711,5 @@ L_res_01D665_0004EE:;
     cpu->di = (uint16_t)(pop16(cpu));        /* pop di */
     cpu->sp = (uint16_t)(cpu->bp);           /* mov sp, bp */
     cpu->bp = (uint16_t)(pop16(cpu));        /* pop bp */
-    cpu->sp += 4; return;                    /* retf */
+    cpu->sp += 4; { RECOMP_CHECK_SP(cpu, "res_01D665"); return; }                    /* retf */
 }

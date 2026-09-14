@@ -20,6 +20,10 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 from decode16 import Decoder, Instruction, OpType
+import decode16
+# civ decodes one function at a time out of a flat image, so a near-call
+# target is relative to that slice and may be negative. See decode16's note.
+decode16.WRAP_NEAR_TARGETS = False
 
 
 @dataclass
@@ -103,6 +107,7 @@ class Analyzer:
 
         functions = []
         current_func = None
+        max_target = 0   # furthest forward branch in current func
         i = 0
 
         while i < len(instructions):
@@ -132,6 +137,7 @@ class Analyzer:
                 # Start new function
                 current_func = Function()
                 current_func.start = inst.offset
+                max_target = 0
                 current_func.overlay_num = overlay_num
                 current_func.is_overlay = overlay_num > 0
 
@@ -165,6 +171,36 @@ class Analyzer:
                 # Detect far returns
                 if inst.mnemonic in ('retf',):
                     current_func.is_far = True
+
+                # How far forward does this function branch?
+                if inst.mnemonic in ('jmp', 'jo', 'jno', 'jb', 'jae', 'je',
+                                     'jne', 'jbe', 'ja', 'js', 'jns', 'jp',
+                                     'jnp', 'jl', 'jge', 'jle', 'jg',
+                                     'loop', 'loopz', 'loopnz', 'jcxz'):
+                    if inst.op1 and inst.op1.type in (OpType.REL8, OpType.REL16):
+                        t = start + inst.op1.disp
+                        if t > max_target:
+                            max_target = t
+
+                # End the function at a return that nothing jumps past.
+                #
+                # Previously a function was closed only when the NEXT prologue
+                # turned up, so one whose real end is followed by data absorbed
+                # all of it. far_1DDE_0523 swallowed a run of text -- 0x50 is
+                # 'P', which decodes as `push ax` -- and ended up with one
+                # prologue and six retf exits, five of them never restoring BP.
+                # BP is callee-saved and global here, so that corrupted the
+                # caller's `mov sp, bp` epilogue and, through it, SP.
+                #
+                # A return with no outstanding forward branch beyond it is the
+                # end. Keeping the max-target test means a switch or a loop that
+                # jumps over a return still holds the function together.
+                if inst.mnemonic in ('ret', 'retf', 'iret') and max_target <= inst.offset:
+                    current_func.end = inst.offset + inst.length
+                    current_func.size = current_func.end - current_func.start
+                    functions.append(current_func)
+                    current_func = None
+                    max_target = 0
 
             i += 1
 

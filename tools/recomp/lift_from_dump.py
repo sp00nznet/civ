@@ -19,6 +19,10 @@ import struct
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from decode16 import Decoder, OpType
+import decode16
+# civ decodes one function at a time out of a flat image, so a near-call
+# target is relative to that slice and may be negative. See decode16's note.
+decode16.WRAP_NEAR_TARGETS = False
 from lift import Lifter
 
 
@@ -362,7 +366,15 @@ def main():
         decoder = Decoder(code, base_offset=dump_off)
         instructions = decoder.decode_range(0, len(code))
 
-        lifter = Lifter(overlay_bases={}, hdr_size=0, known_funcs=known_funcs)
+        lifter = Lifter(overlay_bases={}, hdr_size=0, known_funcs=known_funcs)
+
+        # Indirect call/jmp resolution is gated behind this flag; without
+
+        # it every `call far [mem]` lifts to /* UNHANDLED */ and silently
+
+        # does nothing -- which is how the PIC buffer-fill call vanished.
+
+        lifter.dispatch = True
         try:
             c_code = lifter.lift_function(name, instructions, dump_off, is_far=is_far)
             lifted_code.append((name, dump_off, func_end, c_code))

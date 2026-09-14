@@ -383,6 +383,16 @@ void dos_int21(CPU *cpu)
                 { static int _rc = 0; _rc++;
                   if (_rc <= 20 || n == 0) fprintf(stderr, "[FILE] Read h=%d %u bytes -> %zu (call #%d)\n", cpu->bx, cpu->cx, n, _rc);
                 }
+                /* Did the bytes actually land where the caller asked? A read
+                 * that reports the right count into the wrong place looks
+                 * identical in the log and parses to nothing. */
+                { static int _dumped = 0;
+                  if (!_dumped++ && n > 0) {
+                      fprintf(stderr, "[FILE] dest DS:%04X first 24:", cpu->dx);
+                      for (int b = 0; b < 24 && b < (int)n; b++)
+                          fprintf(stderr, " %02X", cpu->mem[dest + b]);
+                      fprintf(stderr, "\n");
+                  } }
             } else {
                 cpu->ax = 6;  /* Invalid handle */
                 cpu->flags |= FLAG_CF;
@@ -648,6 +658,33 @@ void bios_int10(CPU *cpu)
 
 /* ─── INT 16h - Keyboard BIOS ─── */
 
+/* CIV_KEYSCRIPT, for the INT 16h path.
+ *
+ * The script already drove the game's CRT getch/kbhit, but the startup config
+ * screen does not use those -- it reads the keyboard through INT 16h, which is
+ * why a scripted run sat on "Press Space to continue" forever. The original
+ * does the same thing: the Unicorn oracle shows it spinning 665,510 INT 16h
+ * calls at a single site. Feeding the script here covers every INT 16h caller
+ * at once instead of one prompt at a time.
+ *
+ * Returns AX (scancode<<8 | ascii), or 0 when there is no script left. */
+static uint16_t keyscript_int16(void)
+{
+    const char *ks = getenv("CIV_KEYSCRIPT");
+    static unsigned idx = 0;
+    char c;
+    if (!ks || !ks[0]) return 0;
+    /* Past the end of the script, keep returning the default so menus take
+     * their default item rather than deadlocking the run. */
+    c = ks[idx] ? ks[idx] : (getenv("CIV_KEYDEF") ? getenv("CIV_KEYDEF")[0] : 13);
+    if (ks[idx]) idx++;
+    if (c == '_') c = ' ';
+    {
+        uint8_t sc = (c == ' ') ? 0x39 : (c == 13) ? 0x1C : 0x00;
+        return (uint16_t)((sc << 8) | (uint8_t)c);
+    }
+}
+
 void bios_int16(CPU *cpu)
 {
     KeyboardState *ks = &g_dos->keyboard;
@@ -655,6 +692,8 @@ void bios_int16(CPU *cpu)
     switch (cpu->ah) {
     case 0x00: /* Read key (blocking) */
     case 0x10: /* Extended read key */
+        { uint16_t k = keyscript_int16();
+          if (k) { cpu->ax = k; break; } }
         fprintf(stderr, "[BLOCK] Waiting for key in INT 16h/%02Xh\n", cpu->ah);
         while (!keyboard_available(ks)) {
             if (g_dos->poll_events)
@@ -669,6 +708,8 @@ void bios_int16(CPU *cpu)
         /* Pump events before checking */
         if (g_dos->poll_events)
             g_dos->poll_events(g_dos->platform_ctx, g_dos, cpu);
+        { uint16_t k = keyscript_int16();
+          if (k) { cpu->ax = k; cpu->flags &= ~FLAG_ZF; break; } }
         if (keyboard_available(ks)) {
             cpu->ax = ks->keybuf[ks->head];
             cpu->flags &= ~FLAG_ZF;  /* Key available */
@@ -824,4 +865,17 @@ uint8_t port_in8(CPU *cpu, uint16_t port)
 
     (void)cpu;
     return 0;
+}
+
+/* Word port I/O -- two byte accesses, low half first (ISA bus behaviour). */
+void port_out16(CPU *cpu, uint16_t port, uint16_t value)
+{
+    port_out8(cpu, port, (uint8_t)(value & 0xFF));
+    port_out8(cpu, (uint16_t)(port + 1), (uint8_t)(value >> 8));
+}
+
+uint16_t port_in16(CPU *cpu, uint16_t port)
+{
+    uint16_t lo = port_in8(cpu, port);
+    return (uint16_t)(lo | ((uint16_t)port_in8(cpu, (uint16_t)(port + 1)) << 8));
 }

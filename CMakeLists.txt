@@ -36,6 +36,7 @@ add_library(civ_hal STATIC
     src/recomp/cpu.c
     src/recomp/dos_compat.c
     src/recomp/startup.c
+    src/recomp/dispatch.c
 )
 target_include_directories(civ_hal PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -57,6 +58,7 @@ file(GLOB RECOMP_SOURCES
     "${CMAKE_SOURCE_DIR}/RecompiledFuncs/civ_aliases.c"
     "${CMAKE_SOURCE_DIR}/RecompiledFuncs/civ_impl.c"
     "${CMAKE_SOURCE_DIR}/RecompiledFuncs/civ_dump_lifted.c"
+    "${CMAKE_SOURCE_DIR}/RecompiledFuncs/civ_dispatch.c"
 )
 
 if(RECOMP_SOURCES)

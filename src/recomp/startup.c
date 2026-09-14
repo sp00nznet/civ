@@ -267,6 +267,26 @@ void res_02A310(CPU *cpu)
     }
 
     /*
+     * Step 3b: install the file-refill callback at DS:0xE84A.
+     *
+     * The buffered-read path does `call far word ds:[0xE84A]` to top up its
+     * input buffer -- uni_civ.py names that slot "cb_off". The real CRT
+     * installs the pointer during stream setup; our hand-written fopen
+     * returns an opaque token and skips that, so the slot stayed whatever the
+     * BSS clear left behind. The lifter used to render the call as
+     * /* UNHANDLED *\/ so nobody noticed; once indirect calls actually
+     * dispatched, the decoder read plain data (0xC19E) as a function pointer
+     * and retried 13.6 million times.
+     *
+     * far_1FB6_0642 is that routine, at image segment:offset 1FB6:0642, which
+     * is how the dispatch table is keyed. Must come after the BSS clear above,
+     * which covers this address.
+     */
+    mem_write16(cpu, cpu->ds, 0xE84A, 0x0642);   /* refill callback offset  */
+    mem_write16(cpu, cpu->ds, 0xE84C, 0x1FB6);   /* refill callback segment */
+    printf("[STARTUP] Refill callback DS:E84A = 1FB6:0642\n");
+
+    /*
      * Step 4: Save CRT state variables that __astart normally stores.
      */
     mem_write16(cpu, cpu->ss, 0x5840, cpu->sp);   /* __astktop */

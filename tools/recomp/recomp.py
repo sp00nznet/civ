@@ -14,6 +14,10 @@ import os
 import sys
 import struct
 from decode16 import Decoder
+import decode16
+# civ decodes one function at a time out of a flat image, so a near-call
+# target is relative to that slice and may be negative. See decode16's note.
+decode16.WRAP_NEAR_TARGETS = False
 from analyze import Analyzer
 from lift import Lifter
 
@@ -98,6 +102,10 @@ def recompile(exe_path: str, output_dir: str, funcs_per_file: int = 50):
         # Lift
         lifter = Lifter(overlay_bases=overlay_bases, hdr_size=hdr_size,
                          known_funcs=known_funcs)
+        # Indirect call/jmp resolution is gated behind this flag; without it
+        # every `call far [mem]` lifts to /* UNHANDLED */ and silently does
+        # nothing -- which is how the PIC buffer-fill call vanished.
+        lifter.dispatch = True
         try:
             c_code = lifter.lift_function(
                 func.name, instructions, func.start, func.is_far)

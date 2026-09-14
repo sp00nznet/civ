@@ -31,7 +31,8 @@ import sys
 from unicorn import *
 from unicorn.x86_const import *
 
-GAME_DIR = r"D:\recomp\pc\civ\extracted\Civilization\civ"
+GAME_DIR = os.environ.get("CIV_GAMEDIR",
+                         r"G:\recomp\pc\civ\extracted\Civilization\civ")
 EXE = os.path.join(GAME_DIR, "CIV.EXE")
 TOTAL = 0x110000                 # 1 MB + 64 KB (covers seg:off wraparound)
 # EXEPACK decompresses to dest = CS - dest_len_paragraphs; a low load segment
@@ -491,6 +492,26 @@ def main():
             return st.get("kbd_scan", 0x39)
         return 0xFF
 
+    # VGA DAC. 3C8 selects the entry to write, then three writes to 3C9 give it
+    # R, G and B as 6-bit values. Tracking this is what lets a shot come out in
+    # the game's real colours instead of an invented ramp.
+    def hook_out(uc, port, size, value, _):
+        if port == 0x3C8:
+            st["dac_idx"] = value & 0xFF
+            st["dac_sub"] = 0
+        elif port == 0x3C9:
+            pal = st.setdefault("dac", bytearray(768))
+            i = st.get("dac_idx", 0) & 0xFF
+            sub = st.get("dac_sub", 0)
+            pal[i * 3 + sub] = (value & 0x3F) << 2      # 6-bit DAC -> 8-bit
+            sub += 1
+            if sub == 3:
+                st["dac_sub"] = 0
+                st["dac_idx"] = (i + 1) & 0xFF
+                st["dac_writes"] = st.get("dac_writes", 0) + 1
+            else:
+                st["dac_sub"] = sub
+
     if TRACE:                       # per-instruction hook is the perf bottleneck
         uc.hook_add(UC_HOOK_CODE, hook_code)
     if "--tracealloc" in av:
@@ -499,6 +520,7 @@ def main():
         uc.hook_add(UC_HOOK_CODE, hook_findjump)
     uc.hook_add(UC_HOOK_INTR, hook_intr)
     uc.hook_add(UC_HOOK_INSN, hook_in, None, 1, 0, UC_X86_INS_IN)
+    uc.hook_add(UC_HOOK_INSN, hook_out, None, 1, 0, UC_X86_INS_OUT)
     if "--findfb" in av:
         wpg = st.setdefault("wpg", {})
         def hook_mw(uc, access, address, size, value, _):
@@ -557,14 +579,24 @@ def main():
                   f"bytes={bytes(uc.mem_read(pc, 12)).hex(' ')}")
             print("  opens so far:", st["opens"]); return
         done += SLICE
-        if "--shots" in av and len(st["opens"]) >= 11 and st.get("slice", 0) % 25 == 0:
-            fbb = int(arg(av, "--fb", "0x4a000"), 16)
-            img = bytes(uc.mem_read(fbb, 64000))
-            os.makedirs("work/shots", exist_ok=True)
-            with open(f"work/shots/s{st.get('slice',0):04d}.ppm", "wb") as f:
-                f.write(b"P6\n320 200\n255\n")
-                for b in img:
-                    f.write(bytes([(b * 7) & 0xFF, (b * 3) & 0xFF, (b * 5) & 0xFF]))
+        if "--shots" in av and st.get("slice", 0) % int(arg(av, "--every", "25")) == 0:
+            outdir = arg(av, "--shotdir", "work/shots/original")
+            os.makedirs(outdir, exist_ok=True)
+            pal = st.get("dac") or bytearray(768)
+            # Both surfaces: the VGA aperture and the offscreen buffer the game
+            # composes into. Which one is live changes across startup, and
+            # guessing wrong reports a working frame as black.
+            for tag, fbb in (("a", 0xA0000),
+                             ("o", int(arg(av, "--fb", "0x4a000"), 16))):
+                img = bytes(uc.mem_read(fbb, 64000))
+                name = f"{outdir}/s{st.get('slice', 0):04d}{tag}.ppm"
+                with open(name, "wb") as f:
+                    f.write(b"P6\n320 200\n255\n")
+                    f.write(bytes(b for px in img for b in pal[px*3:px*3+3]))
+            nzA = sum(1 for b in bytes(uc.mem_read(0xA0000, 64000)) if b)
+            print(f"  [SHOT] slice {st.get('slice',0)} opens={len(st['opens'])} "
+                  f"dac_entries={st.get('dac_writes', 0)} nzA={nzA}")
+
         if len(st["opens"]) >= 11:                # at menu: keep the richest A0000
             samp = bytes(uc.mem_read(0xA0000, 64000))
             var = len(set(samp[::97]))

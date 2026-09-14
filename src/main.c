@@ -1,299 +1,347 @@
-/*
- * main.c - Civilization Recompilation Entry Point
- *
- * Initializes the CPU state, loads the game data into flat memory,
- * sets up the DOS compatibility layer and SDL2 platform, then runs
- * the recompiled game code in a frame-driven main loop.
- *
- * Part of the Civ Recomp project (sp00nznet/civ)
- */
+/*
+ * main.c - Civilization Recompilation Entry Point
+ *
+ * Initializes the CPU state, loads the game data into flat memory,
+ * sets up the DOS compatibility layer and SDL2 platform, then runs
+ * the recompiled game code in a frame-driven main loop.
+ *
+ * Part of the Civ Recomp project (sp00nznet/civ)
+ */
+
+#include "recomp/cpu.h"
+#include "recomp/dos_compat.h"
+#include "platform/sdl_platform.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* Pull in the recompiled function declarations */
+#include "civ_recomp.h"
+
+/* ── Temporary crash diagnostics: resolve a segfault to a C symbol ── */
+#ifdef _WIN32
+#include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+static LONG WINAPI civ_crash_filter(EXCEPTION_POINTERS *ep)
+{
+    void *frames[32];
+    USHORT n = CaptureStackBackTrace(0, 32, frames, NULL);
+    HANDLE proc = GetCurrentProcess();
+    SymInitialize(proc, NULL, TRUE);
+    fprintf(stderr, "\n[CRASH] code=0x%08lX addr=%p\n",
+            ep->ExceptionRecord->ExceptionCode,
+            ep->ExceptionRecord->ExceptionAddress);
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        fprintf(stderr, "[CRASH] access %s at 0x%p\n",
+                ep->ExceptionRecord->ExceptionInformation[0] ? "WRITE" : "READ",
+                (void *)ep->ExceptionRecord->ExceptionInformation[1]);
+    }
+    char buf[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+    sym->MaxNameLen = 255;
+    for (USHORT i = 0; i < n; i++) {
+        DWORD64 disp = 0;
+        if (SymFromAddr(proc, (DWORD64)(uintptr_t)frames[i], &disp, sym))
+            fprintf(stderr, "[CRASH]  #%2u %s +0x%llX\n", i, sym->Name,
+                    (unsigned long long)disp);
+        else
+            fprintf(stderr, "[CRASH]  #%2u %p\n", i, frames[i]);
+    }
+    fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+#endif
+
+/* Entry point provided by startup.c (replaces MSC crt0) */
+extern void res_02A310(CPU *cpu);
+
+/* Set by res_01FB68 when the title background arch.pic loads (diagnostics). */
+int g_arch_pic_loaded = 0;
+
+/* Write VGA page 0 through the current DAC palette as a binary PPM. The four
+ * capture sites all used to carry their own copy of this loop. */
+static int dump_ppm_at(const char *path, const CPU *c, DosState *dos, uint32_t base)
+{
+    uint32_t rgba[256];
+    FILE *f = fopen(path, "wb");
+    if (!f) return 0;
+    video_get_rgba_palette(&dos->video, rgba);
+    fprintf(f, "P6\n320 200\n255\n");
+    for (int i = 0; i < 320 * 200; i++) {
+        uint32_t px = rgba[c->mem[base + i]];
+        uint8_t rgb[3] = { (uint8_t)px, (uint8_t)(px >> 8), (uint8_t)(px >> 16) };
+        fwrite(rgb, 1, 3, f);
+    }
+    fclose(f);
+    return 1;
+}
 
-#include "recomp/cpu.h"
-#include "recomp/dos_compat.h"
-#include "platform/sdl_platform.h"
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
-/* Pull in the recompiled function declarations */
-#include "civ_recomp.h"
-
-/* ── Temporary crash diagnostics: resolve a segfault to a C symbol ── */
-#ifdef _WIN32
-#include <windows.h>
-#include <dbghelp.h>
-#pragma comment(lib, "dbghelp.lib")
-static LONG WINAPI civ_crash_filter(EXCEPTION_POINTERS *ep)
-{
-    void *frames[32];
-    USHORT n = CaptureStackBackTrace(0, 32, frames, NULL);
-    HANDLE proc = GetCurrentProcess();
-    SymInitialize(proc, NULL, TRUE);
-    fprintf(stderr, "\n[CRASH] code=0x%08lX addr=%p\n",
-            ep->ExceptionRecord->ExceptionCode,
-            ep->ExceptionRecord->ExceptionAddress);
-    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        fprintf(stderr, "[CRASH] access %s at 0x%p\n",
-                ep->ExceptionRecord->ExceptionInformation[0] ? "WRITE" : "READ",
-                (void *)ep->ExceptionRecord->ExceptionInformation[1]);
-    }
-    char buf[sizeof(SYMBOL_INFO) + 256];
-    SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
-    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
-    sym->MaxNameLen = 255;
-    for (USHORT i = 0; i < n; i++) {
-        DWORD64 disp = 0;
-        if (SymFromAddr(proc, (DWORD64)(uintptr_t)frames[i], &disp, sym))
-            fprintf(stderr, "[CRASH]  #%2u %s +0x%llX\n", i, sym->Name,
-                    (unsigned long long)disp);
-        else
-            fprintf(stderr, "[CRASH]  #%2u %p\n", i, frames[i]);
-    }
-    fflush(stderr);
-    return EXCEPTION_EXECUTE_HANDLER;
-}
-#endif
-
-/* Entry point provided by startup.c (replaces MSC crt0) */
-extern void res_02A310(CPU *cpu);
-
-/* Set by res_01FB68 when the title background arch.pic loads (diagnostics). */
-int g_arch_pic_loaded = 0;
-
-/* Poll callback: pumps SDL events and renders the framebuffer.
- * Called from within game code when it blocks waiting for input. */
-static void game_poll_callback(void *platform_ctx, void *dos_state, const void *cpu)
-{
-    Platform *plat = (Platform *)platform_ctx;
-    DosState *dos = (DosState *)dos_state;
-    const CPU *c = (const CPU *)cpu;
-
-    platform_poll_events(plat, dos);
-    platform_render(plat, c, dos);
-
-    /* [RENDERDIAG] black-screen classification — set env CIV_RENDERDIAG=1 to enable.
-     * Reports video mode, palette richness, and non-zero pixel counts per page. */
-    {
-        static int rd_on = -1;
-        if (rd_on < 0) rd_on = getenv("CIV_RENDERDIAG") ? 1 : 0;
-        static unsigned rd = 0;
-        if (rd_on && (rd++ % 8) == 0) {
-            uint8_t vmode = c->mem[0x449];
-            /* palette entries beyond the default 0-31 that are non-zero */
-            int pal_rich = 0;
-            for (int i = 32; i < 256; i++)
-                if (dos->video.palette[i][0] | dos->video.palette[i][1] | dos->video.palette[i][2])
-                    pal_rich++;
-            /* non-zero pixel counts + page-0 bounding box / sample color */
-            long nzA = 0, nzC = 0, nzD = 0;
-            int minx=320,miny=200,maxx=-1,maxy=-1,sample=0;
-            for (int yy = 0; yy < 200; yy++) for (int xx = 0; xx < 320; xx++) {
-                uint8_t v = c->mem[0xA0000 + yy*320 + xx];
-                if (v) { nzA++; if(xx<minx)minx=xx; if(xx>maxx)maxx=xx; if(yy<miny)miny=yy; if(yy>maxy)maxy=yy; if(!sample)sample=v; }
-                if (c->mem[0xC0000 + yy*320+xx]) nzC++;
-                if (c->mem[0xD0000 + yy*320+xx]) nzD++;
-            }
-            fprintf(stderr,
+/* Page 0 is what most callers want. */
+#define dump_page0_ppm(p, c, d) dump_ppm_at((p), (c), (d), 0xA0000)
+
+/* The B8000 text screen, as text. Mode 3 is not a dead end to be reported as
+ * a black frame -- it is where the game's startup config screen lives, and
+ * reading it is the whole point of capturing during startup. */
+static int dump_text_screen(const char *path, const CPU *c)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) return 0;
+    for (int row = 0; row < 25; row++) {
+        char line[81];
+        for (int col = 0; col < 80; col++) {
+            unsigned char ch = c->mem[0xB8000 + (row * 80 + col) * 2];
+            line[col] = (ch >= 32 && ch < 127) ? (char)ch : ' ';
+        }
+        line[80] = 0;
+        int end = 79;
+        while (end >= 0 && line[end] == ' ') line[end--] = 0;
+        fprintf(f, "%s\n", line);
+    }
+    fclose(f);
+    return 1;
+}
+
+/* Poll callback: pumps SDL events and renders the framebuffer.
+ * Called from within game code when it blocks waiting for input. */
+static void game_poll_callback(void *platform_ctx, void *dos_state, const void *cpu)
+{
+    Platform *plat = (Platform *)platform_ctx;
+    DosState *dos = (DosState *)dos_state;
+    const CPU *c = (const CPU *)cpu;
+
+    platform_poll_events(plat, dos);
+    platform_render(plat, c, dos);
+
+    /* [RENDERDIAG] black-screen classification + frame capture.
+     *
+     * CIV_RENDERDIAG=1   report video mode, palette richness, per-page pixel counts
+     * CIV_SHOTS=<dir>    write every Nth frame there as a PPM (see tools/shots.py)
+     * CIV_SHOTS_EVERY=N  frames between captures (default 8 diagnostic ticks)
+     * CIV_SHOTS_MAX=N    stop after N frames (default 24)
+     *
+     * The capture is deliberately NOT gated on the framebuffer having content.
+     * It used to be -- every dump sat behind `nzA > 50` -- which meant the one
+     * failure worth a screenshot, a screen that never draws, was the one case
+     * that silently produced no screenshot. A black frame is a result.
+     */
+    {
+        static int rd_on = -1, shots_max = 0, shots_every = 0, shot_n = 0;
+        static const char *shots_dir = NULL;
+        if (rd_on < 0) {
+            shots_dir = getenv("CIV_SHOTS");
+            rd_on = (getenv("CIV_RENDERDIAG") || shots_dir) ? 1 : 0;
+            shots_max = getenv("CIV_SHOTS_MAX") ? atoi(getenv("CIV_SHOTS_MAX")) : 24;
+            shots_every = getenv("CIV_SHOTS_EVERY") ? atoi(getenv("CIV_SHOTS_EVERY")) : 1;
+            if (shots_every < 1) shots_every = 1;
+        }
+        static unsigned rd = 0;
+        if (rd_on && (rd++ % 8) == 0) {
+            unsigned tick = rd / 8;
+            uint8_t vmode = c->mem[0x449];
+            /* palette entries beyond the default 0-31 that are non-zero */
+            int pal_rich = 0;
+            for (int i = 32; i < 256; i++)
+                if (dos->video.palette[i][0] | dos->video.palette[i][1] | dos->video.palette[i][2])
+                    pal_rich++;
+            /* non-zero pixel counts + page-0 bounding box / sample color */
+            long nzA = 0, nzC = 0, nzD = 0;
+            int minx=320,miny=200,maxx=-1,maxy=-1,sample=0;
+            for (int yy = 0; yy < 200; yy++) for (int xx = 0; xx < 320; xx++) {
+                uint8_t v = c->mem[0xA0000 + yy*320 + xx];
+                if (v) { nzA++; if(xx<minx)minx=xx; if(xx>maxx)maxx=xx; if(yy<miny)miny=yy; if(yy>maxy)maxy=yy; if(!sample)sample=v; }
+                if (c->mem[0xC0000 + yy*320+xx]) nzC++;
+                if (c->mem[0xD0000 + yy*320+xx]) nzD++;
+            }
+            fprintf(stderr,
                 "[RENDERDIAG] #%u vmode=0x%02X pal_rich=%d/224 nzA=%ld(bbox %d,%d..%d,%d col=%d) nzC=%ld nzD=%ld\n",
-                rd, vmode, pal_rich, nzA, minx,miny,maxx,maxy,sample, nzC, nzD);
-            /* Dump page-0 framebuffer (palette-applied) to a PPM once, to verify
-             * content independent of SDL. */
-            /* When arch.pic (title background) has loaded and rendered, snapshot it. */
-            static int arch_dumped = 0;
-            if (!arch_dumped && g_arch_pic_loaded && nzA > 1500) {
-                arch_dumped = 1;
-                uint32_t rgba3[256]; video_get_rgba_palette(&dos->video, rgba3);
-                FILE *af = fopen("fb_title.ppm", "wb");
-                if (af) {
-                    fprintf(af, "P6\n320 200\n255\n");
-                    for (int i = 0; i < 320*200; i++) {
-                        uint32_t px = rgba3[c->mem[0xA0000 + i]];
-                        uint8_t rgb[3] = { (uint8_t)px, (uint8_t)(px>>8), (uint8_t)(px>>16) };
-                        fwrite(rgb, 1, 3, af);
+                tick, vmode, pal_rich, nzA, minx,miny,maxx,maxy,sample, nzC, nzD);
+
+            if (shots_dir && shot_n < shots_max && (tick % (unsigned)shots_every) == 0) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/f%04d.ppm", shots_dir, shot_n);
+                if (vmode == 0x03) {
+                    snprintf(path, sizeof(path), "%s/f%04d.txt", shots_dir, shot_n);
+                    if (dump_text_screen(path, c))
+                        fprintf(stderr, "[SHOT] %s (tick %u TEXT mode 3)\n", path, tick);
+                } else if (dump_page0_ppm(path, c, dos)) {
+                    fprintf(stderr, "[SHOT] %s (tick %u nzA=%ld pal_rich=%d)\n",
+                            path, tick, nzA, pal_rich);
+                    /* The game composes into an offscreen page and blits; the
+                     * oracle shows the original doing the same. Photographing
+                     * only A0000 reports a finished frame as black. */
+                    if (nzC > 0) {
+                        char p2[512];
+                        snprintf(p2, sizeof(p2), "%s/f%04d_C.ppm", shots_dir, shot_n);
+                        dump_ppm_at(p2, c, dos, 0xC0000);
                     }
-                    fclose(af);
+                }
+                shot_n++;
+            }
+            /* Legacy one-shot dumps, kept so existing notes still reproduce. */
+            static int arch_dumped = 0;
+            if (!arch_dumped && g_arch_pic_loaded && nzA > 1500) {
+                arch_dumped = 1;
+                if (dump_page0_ppm("fb_title.ppm", c, dos))
                     fprintf(stderr, "[RENDERDIAG] wrote fb_title.ppm\n");
-                }
-            }
-            static int dumped = 0; static unsigned last_dump = 0;
-            if (getenv("CIV_DUMPALL") ? (dumped < 12 && nzA > 100 && (rd - last_dump) >= 16)
-                                      : (!dumped && nzA > 100)) {
-                dumped++; last_dump = rd;
-                char fbname[32];
-                if (getenv("CIV_DUMPALL")) snprintf(fbname, sizeof(fbname), "fb_%02d.ppm", dumped);
-                else snprintf(fbname, sizeof(fbname), "fb_dump.ppm");
-                uint32_t rgba2[256]; video_get_rgba_palette(&dos->video, rgba2);
-                FILE *f = fopen(fbname, "wb");
-                if (f) {
-                    fprintf(f, "P6\n320 200\n255\n");
-                    for (int i = 0; i < 320*200; i++) {
-                        uint32_t px = rgba2[c->mem[0xA0000 + i]];
-                        uint8_t rgb[3] = { (uint8_t)px, (uint8_t)(px>>8), (uint8_t)(px>>16) };
-                        fwrite(rgb, 1, 3, f);
-                    }
-                    fclose(f);
-                }
-            }
-            /* CIV_DUMPLATEST: continuously overwrite fb_latest.ppm with the most
-             * recent frame (every 32 render-diags) so we can inspect the live
-             * game-loop screen (map) long after the bounded fb_NN dumps stop. */
-            if (getenv("CIV_DUMPLATEST") && nzA > 50) {
-                static unsigned last_latest = 0;
-                if (rd - last_latest >= 32) {
-                    last_latest = rd;
-                    uint32_t rgbaL[256]; video_get_rgba_palette(&dos->video, rgbaL);
-                    FILE *f = fopen("fb_latest.ppm", "wb");
-                    if (f) {
-                        fprintf(f, "P6\n320 200\n255\n");
-                        for (int i = 0; i < 320*200; i++) {
-                            uint32_t px = rgbaL[c->mem[0xA0000 + i]];
-                            uint8_t rgb[3] = { (uint8_t)px, (uint8_t)(px>>8), (uint8_t)(px>>16) };
-                            fwrite(rgb, 1, 3, f);
-                        }
-                        fclose(f);
-                    }
-                }
-            }
-            fflush(stderr);
-        }
-    }
-
-    /* Keep timer advancing during blocking I/O waits */
-    timer_update(&dos->timer, (uint64_t)clock() * 1000ULL / CLOCKS_PER_SEC);
-
-    platform_delay(1); /* Yield CPU to avoid 100% spin */
-}
-
-/*
- * MZ Header values for CIV.EXE (from binary analysis):
- *   Header size:      0x200 bytes (32 paragraphs)
- *   Code image size:  ~178 KB (resident)
- *   Entry point:      CS:IP = 2A10:0010 (relative to load module)
- *   Stack:            SS:SP from header (relative to load module)
- *   Overlays:         23 modules (resolved at recomp time via INT 3Fh)
- *
- * The load module starts right after the MZ header. In real DOS, it
- * loads after the PSP (256 bytes). We place it at LOAD_SEG:0000.
- */
-
-#define LOAD_SEG        0x0100  /* Segment where DOS loads the program image */
-#define MZ_HEADER_SIZE  0x200   /* Size of MZ header to skip when loading data */
-
-/* MZ header field offsets */
-#define MZ_SS           0x0E    /* Initial SS (relative to load module) */
-#define MZ_SP           0x10    /* Initial SP */
-#define MZ_CS           0x16    /* Initial CS (relative to load module) */
-#define MZ_IP           0x14    /* Initial IP */
-
-/* Target frame rate for the main loop */
-#define TARGET_FPS      30
-#define FRAME_TIME_MS   (1000 / TARGET_FPS)
-
-static int load_exe_data(CPU *cpu, const char *exe_path)
-{
-    FILE *f = fopen(exe_path, "rb");
-    if (!f) {
-        fprintf(stderr, "Error: cannot open '%s'\n", exe_path);
-        return -1;
-    }
-
-    /* Read MZ header to get load parameters */
-    uint8_t hdr[64];
-    if (fread(hdr, 1, 64, f) < 64) {
-        fprintf(stderr, "Error: failed to read MZ header\n");
-        fclose(f);
-        return -1;
-    }
-
-    /* Verify MZ signature */
-    if (hdr[0] != 'M' || hdr[1] != 'Z') {
-        fprintf(stderr, "Error: not a valid MZ executable\n");
-        fclose(f);
-        return -1;
-    }
-
-    uint16_t hdr_paras = *(uint16_t *)(hdr + 8);
-    uint32_t hdr_size = (uint32_t)hdr_paras * 16;
-    uint16_t init_ss = *(uint16_t *)(hdr + MZ_SS);
-    uint16_t init_sp = *(uint16_t *)(hdr + MZ_SP);
-    uint16_t init_cs = *(uint16_t *)(hdr + MZ_CS);
-    uint16_t init_ip = *(uint16_t *)(hdr + MZ_IP);
-
-    /* Calculate resident image size from MZ header page count.
-     * DOS only loads the resident image, NOT the overlay modules that
-     * follow it in the file.  Loading the full file would place overlay
-     * MZ headers into the DGROUP area and corrupt initialized data. */
-    uint16_t mz_last_page = *(uint16_t *)(hdr + 2);  /* bytes on last page */
-    uint16_t mz_pages     = *(uint16_t *)(hdr + 4);  /* pages in file */
-    long mz_image_total;
-    if (mz_last_page > 0)
-        mz_image_total = (long)(mz_pages - 1) * 512 + mz_last_page;
-    else
-        mz_image_total = (long)mz_pages * 512;
-
-    uint32_t load_addr = seg_off(LOAD_SEG, 0);
-    long image_size = mz_image_total - (long)hdr_size;
-
-    if (load_addr + image_size > MEM_SIZE) {
-        fprintf(stderr, "Error: EXE image too large (%ld bytes)\n", image_size);
-        fclose(f);
-        return -1;
-    }
-
-    fseek(f, hdr_size, SEEK_SET);
-    size_t read = fread(cpu->mem + load_addr, 1, image_size, f);
-    fclose(f);
-
-    if ((long)read != image_size) {
-        fprintf(stderr, "Error: short read (%zu of %ld)\n", read, image_size);
-        return -1;
-    }
-
-    /* Set up CPU registers as DOS would after loading */
-    cpu->cs = LOAD_SEG + init_cs;
-    cpu->ip = init_ip;
-    cpu->ss = LOAD_SEG + init_ss;
-    cpu->sp = init_sp;
-
-    /* DS and ES point to PSP (LOAD_SEG - 0x10) as DOS convention */
-    cpu->ds = LOAD_SEG;
-    cpu->es = LOAD_SEG;
-
-    /* Set up a minimal PSP at LOAD_SEG - 0x10 */
-    uint16_t psp_seg = LOAD_SEG - 0x10;
-    /* INT 20h at PSP:0000 (program terminate) */
-    mem_write8(cpu, psp_seg, 0x0000, 0xCD);  /* INT */
-    mem_write8(cpu, psp_seg, 0x0001, 0x20);  /* 20h */
-    /* Top of memory at PSP:0002 */
-    mem_write16(cpu, psp_seg, 0x0002, 0xA000);
-    /* Empty command tail at PSP:0080 */
-    mem_write8(cpu, psp_seg, 0x0080, 0);
-    mem_write8(cpu, psp_seg, 0x0081, 0x0D);
-
-    printf("[MAIN] Loaded EXE: %ld bytes at %04X:0000 (flat 0x%06X)\n",
-           image_size, LOAD_SEG, load_addr);
-    printf("[MAIN] Entry: %04X:%04X  Stack: %04X:%04X\n",
-           cpu->cs, cpu->ip, cpu->ss, cpu->sp);
-
-    return 0;
-}
-
-int main(int argc, char *argv[])
-{
-    printf("============================================================\n");
-    printf("  Sid Meier's Civilization - Static Recompilation\n");
-    printf("  Original (c) 1991 MicroProse Software, Inc.\n");
-    printf("  Recompiled for modern systems by sp00nznet\n");
-    printf("============================================================\n\n");
-
-    /* Parse arguments */
-    const char *game_dir = NULL;
-    const char *exe_path = NULL;
-    int scale = WINDOW_SCALE;
-
-    for (int i = 1; i < argc; i++) {
+            }
+            static int dumped = 0; static unsigned last_dump = 0;
+            if (getenv("CIV_DUMPALL") ? (dumped < 12 && nzA > 100 && (rd - last_dump) >= 16)
+                                      : (!dumped && nzA > 100)) {
+                char fbname[32];
+                dumped++; last_dump = rd;
+                if (getenv("CIV_DUMPALL")) snprintf(fbname, sizeof(fbname), "fb_%02d.ppm", dumped);
+                else snprintf(fbname, sizeof(fbname), "fb_dump.ppm");
+                dump_page0_ppm(fbname, c, dos);
+            }
+            if (getenv("CIV_DUMPLATEST") && nzA > 50) {
+                static unsigned last_latest = 0;
+                if (rd - last_latest >= 32) {
+                    last_latest = rd;
+                    dump_page0_ppm("fb_latest.ppm", c, dos);
+                }
+            }
+            fflush(stderr);
+        }
+    }
+
+    /* Keep timer advancing during blocking I/O waits */
+    timer_update(&dos->timer, (uint64_t)clock() * 1000ULL / CLOCKS_PER_SEC);
+
+    platform_delay(1); /* Yield CPU to avoid 100% spin */
+}
+
+/*
+ * MZ Header values for CIV.EXE (from binary analysis):
+ *   Header size:      0x200 bytes (32 paragraphs)
+ *   Code image size:  ~178 KB (resident)
+ *   Entry point:      CS:IP = 2A10:0010 (relative to load module)
+ *   Stack:            SS:SP from header (relative to load module)
+ *   Overlays:         23 modules (resolved at recomp time via INT 3Fh)
+ *
+ * The load module starts right after the MZ header. In real DOS, it
+ * loads after the PSP (256 bytes). We place it at LOAD_SEG:0000.
+ */
+
+#define LOAD_SEG        0x0100  /* Segment where DOS loads the program image */
+#define MZ_HEADER_SIZE  0x200   /* Size of MZ header to skip when loading data */
+
+/* MZ header field offsets */
+#define MZ_SS           0x0E    /* Initial SS (relative to load module) */
+#define MZ_SP           0x10    /* Initial SP */
+#define MZ_CS           0x16    /* Initial CS (relative to load module) */
+#define MZ_IP           0x14    /* Initial IP */
+
+/* Target frame rate for the main loop */
+#define TARGET_FPS      30
+#define FRAME_TIME_MS   (1000 / TARGET_FPS)
+
+static int load_exe_data(CPU *cpu, const char *exe_path)
+{
+    FILE *f = fopen(exe_path, "rb");
+    if (!f) {
+        fprintf(stderr, "Error: cannot open '%s'\n", exe_path);
+        return -1;
+    }
+
+    /* Read MZ header to get load parameters */
+    uint8_t hdr[64];
+    if (fread(hdr, 1, 64, f) < 64) {
+        fprintf(stderr, "Error: failed to read MZ header\n");
+        fclose(f);
+        return -1;
+    }
+
+    /* Verify MZ signature */
+    if (hdr[0] != 'M' || hdr[1] != 'Z') {
+        fprintf(stderr, "Error: not a valid MZ executable\n");
+        fclose(f);
+        return -1;
+    }
+
+    uint16_t hdr_paras = *(uint16_t *)(hdr + 8);
+    uint32_t hdr_size = (uint32_t)hdr_paras * 16;
+    uint16_t init_ss = *(uint16_t *)(hdr + MZ_SS);
+    uint16_t init_sp = *(uint16_t *)(hdr + MZ_SP);
+    uint16_t init_cs = *(uint16_t *)(hdr + MZ_CS);
+    uint16_t init_ip = *(uint16_t *)(hdr + MZ_IP);
+
+    /* Calculate resident image size from MZ header page count.
+     * DOS only loads the resident image, NOT the overlay modules that
+     * follow it in the file.  Loading the full file would place overlay
+     * MZ headers into the DGROUP area and corrupt initialized data. */
+    uint16_t mz_last_page = *(uint16_t *)(hdr + 2);  /* bytes on last page */
+    uint16_t mz_pages     = *(uint16_t *)(hdr + 4);  /* pages in file */
+    long mz_image_total;
+    if (mz_last_page > 0)
+        mz_image_total = (long)(mz_pages - 1) * 512 + mz_last_page;
+    else
+        mz_image_total = (long)mz_pages * 512;
+
+    uint32_t load_addr = seg_off(LOAD_SEG, 0);
+    long image_size = mz_image_total - (long)hdr_size;
+
+    if (load_addr + image_size > MEM_SIZE) {
+        fprintf(stderr, "Error: EXE image too large (%ld bytes)\n", image_size);
+        fclose(f);
+        return -1;
+    }
+
+    fseek(f, hdr_size, SEEK_SET);
+    size_t read = fread(cpu->mem + load_addr, 1, image_size, f);
+    fclose(f);
+
+    if ((long)read != image_size) {
+        fprintf(stderr, "Error: short read (%zu of %ld)\n", read, image_size);
+        return -1;
+    }
+
+    /* Set up CPU registers as DOS would after loading */
+    cpu->cs = LOAD_SEG + init_cs;
+    cpu->ip = init_ip;
+    cpu->ss = LOAD_SEG + init_ss;
+    cpu->sp = init_sp;
+
+    /* DS and ES point to PSP (LOAD_SEG - 0x10) as DOS convention */
+    cpu->ds = LOAD_SEG;
+    cpu->es = LOAD_SEG;
+
+    /* Set up a minimal PSP at LOAD_SEG - 0x10 */
+    uint16_t psp_seg = LOAD_SEG - 0x10;
+    /* INT 20h at PSP:0000 (program terminate) */
+    mem_write8(cpu, psp_seg, 0x0000, 0xCD);  /* INT */
+    mem_write8(cpu, psp_seg, 0x0001, 0x20);  /* 20h */
+    /* Top of memory at PSP:0002 */
+    mem_write16(cpu, psp_seg, 0x0002, 0xA000);
+    /* Empty command tail at PSP:0080 */
+    mem_write8(cpu, psp_seg, 0x0080, 0);
+    mem_write8(cpu, psp_seg, 0x0081, 0x0D);
+
+    printf("[MAIN] Loaded EXE: %ld bytes at %04X:0000 (flat 0x%06X)\n",
+           image_size, LOAD_SEG, load_addr);
+    printf("[MAIN] Entry: %04X:%04X  Stack: %04X:%04X\n",
+           cpu->cs, cpu->ip, cpu->ss, cpu->sp);
+
+    return 0;
+}
+
+int main(int argc, char *argv[])
+{
+    printf("============================================================\n");
+    printf("  Sid Meier's Civilization - Static Recompilation\n");
+    printf("  Original (c) 1991 MicroProse Software, Inc.\n");
+    printf("  Recompiled for modern systems by sp00nznet\n");
+    printf("============================================================\n\n");
+
+    /* Parse arguments */
+    const char *game_dir = NULL;
+    const char *exe_path = NULL;
+    int scale = WINDOW_SCALE;
+
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc) {
             scale = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--gamedir") == 0 && i + 1 < argc) {
@@ -307,98 +355,100 @@ int main(int argc, char *argv[])
     if (!exe_path)
         exe_path = "CIV.EXE";
     if (!game_dir)
-        game_dir = ".";
-
-    printf("[MAIN] EXE path:  %s\n", exe_path);
-    printf("[MAIN] Game dir:  %s\n", game_dir);
-    printf("[MAIN] Scale:     %dx\n\n", scale);
-
-    /* Initialize CPU */
-    CPU cpu;
-    cpu_init(&cpu);
-    if (cpu_alloc_mem(&cpu) < 0)
-        return 1;
-
-    /* Load the EXE data segment into memory */
-    if (load_exe_data(&cpu, exe_path) < 0) {
-        cpu_free(&cpu);
-        return 1;
-    }
-
-    /* Initialize DOS compatibility layer */
-    DosState dos;
-    dos_init(&dos, &cpu, game_dir);
-
-    /* Initialize SDL2 platform */
-    Platform plat;
-    if (platform_init(&plat, scale) < 0) {
-        cpu_free(&cpu);
-        return 1;
-    }
-
-    /* Hook the platform event loop into the DOS layer so blocking
-     * I/O calls (getch, kbhit, etc.) can pump SDL events. */
-    dos.poll_events = game_poll_callback;
-    dos.platform_ctx = &plat;
-
-    printf("[MAIN] Starting game...\n\n");
-
-    /*
-     * Main loop strategy:
-     *
-     * The original game is a single-threaded DOS program that runs in
-     * a tight loop. In our recompilation, the game code has been
-     * translated to C functions that manipulate the CPU state struct.
-     *
-     * We call the entry point function which runs the MSC runtime
-     * startup (initializing DS, BSS, etc.) and then jumps to the
-     * game's actual main(). The game code returns when it exits
-     * (INT 21h/4Ch sets cpu.halted = 1).
-     *
-     * Between frames we poll SDL events, update the timer, and render.
-     * The game's own timing loops read the timer tick count which we
-     * update based on real elapsed time.
-     */
-
-    /* Run the entry point - this executes the MSC startup and game main */
-    /* For now, we use a frame-based approach where we call the entry
-     * point once and let it run. The game's internal loops will call
-     * our INT handlers which eventually need to yield for frame updates.
-     *
-     * TODO: In Phase 4, implement cooperative yielding so the game
-     * loop can be interleaved with SDL event processing.
-     */
-
-    /*
-     * The game's entry point runs the MSC startup, then calls
-     * ovl05_031396 (C main), which calls ovl21_048200 (game loop).
-     * The game runs as a single blocking call - it loops internally.
-     * When it exits (INT 21h/4Ch), cpu.halted is set and it returns.
-     *
-     * For now, call the entry point once. The game's internal loops
-     * will run to completion. DOS API calls (INT 21h, etc.) handle
-     * all I/O through our compatibility layer.
-     *
-     * TODO: Phase 4 - Add cooperative yielding so the game's internal
-     * loops interleave with SDL event processing for proper rendering.
-     */
-#ifdef _WIN32
-    SetUnhandledExceptionFilter(civ_crash_filter);
-#endif
-    CIV_ENTRY_POINT(&cpu);
-
-    /* If the game returns without halting, run a post-game render loop */
-    while (plat.running && !cpu.halted) {
-        platform_poll_events(&plat, &dos);
-        platform_render(&plat, &cpu, &dos);
-        platform_delay(FRAME_TIME_MS);
-    }
-
-    printf("\n[MAIN] Game ended.\n");
-
-    /* Cleanup */
-    platform_shutdown(&plat);
-    cpu_free(&cpu);
-
-    return 0;
-}
+        game_dir = ".";
+
+    printf("[MAIN] EXE path:  %s\n", exe_path);
+    printf("[MAIN] Game dir:  %s\n", game_dir);
+    printf("[MAIN] Scale:     %dx\n\n", scale);
+
+    /* Initialize CPU */
+    CPU cpu;
+    cpu_init(&cpu);
+    if (cpu_alloc_mem(&cpu) < 0)
+        return 1;
+
+    /* Load the EXE data segment into memory */
+    if (load_exe_data(&cpu, exe_path) < 0) {
+        cpu_free(&cpu);
+        return 1;
+    }
+
+    /* Initialize DOS compatibility layer */
+    DosState dos;
+    dos_init(&dos, &cpu, game_dir);
+
+    /* Initialize SDL2 platform */
+    Platform plat;
+    if (platform_init(&plat, scale) < 0) {
+        cpu_free(&cpu);
+        return 1;
+    }
+
+    /* Hook the platform event loop into the DOS layer so blocking
+     * I/O calls (getch, kbhit, etc.) can pump SDL events. */
+    dos.poll_events = game_poll_callback;
+    dos.platform_ctx = &plat;
+
+    /* Call trace: opt-in, because it counts every lifted call. */
+    g_trace_fn = getenv("CIV_TRACEFN") ? atoi(getenv("CIV_TRACEFN")) : 0;
+    printf("[MAIN] Starting game...\n\n");
+
+    /*
+     * Main loop strategy:
+     *
+     * The original game is a single-threaded DOS program that runs in
+     * a tight loop. In our recompilation, the game code has been
+     * translated to C functions that manipulate the CPU state struct.
+     *
+     * We call the entry point function which runs the MSC runtime
+     * startup (initializing DS, BSS, etc.) and then jumps to the
+     * game's actual main(). The game code returns when it exits
+     * (INT 21h/4Ch sets cpu.halted = 1).
+     *
+     * Between frames we poll SDL events, update the timer, and render.
+     * The game's own timing loops read the timer tick count which we
+     * update based on real elapsed time.
+     */
+
+    /* Run the entry point - this executes the MSC startup and game main */
+    /* For now, we use a frame-based approach where we call the entry
+     * point once and let it run. The game's internal loops will call
+     * our INT handlers which eventually need to yield for frame updates.
+     *
+     * TODO: In Phase 4, implement cooperative yielding so the game
+     * loop can be interleaved with SDL event processing.
+     */
+
+    /*
+     * The game's entry point runs the MSC startup, then calls
+     * ovl05_031396 (C main), which calls ovl21_048200 (game loop).
+     * The game runs as a single blocking call - it loops internally.
+     * When it exits (INT 21h/4Ch), cpu.halted is set and it returns.
+     *
+     * For now, call the entry point once. The game's internal loops
+     * will run to completion. DOS API calls (INT 21h, etc.) handle
+     * all I/O through our compatibility layer.
+     *
+     * TODO: Phase 4 - Add cooperative yielding so the game's internal
+     * loops interleave with SDL event processing for proper rendering.
+     */
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(civ_crash_filter);
+#endif
+    CIV_ENTRY_POINT(&cpu);
+
+    /* If the game returns without halting, run a post-game render loop */
+    while (plat.running && !cpu.halted) {
+        platform_poll_events(&plat, &dos);
+        platform_render(&plat, &cpu, &dos);
+        platform_delay(FRAME_TIME_MS);
+    }
+
+    printf("\n[MAIN] Game ended.\n");
+
+    /* Cleanup */
+    platform_shutdown(&plat);
+    cpu_free(&cpu);
+
+    return 0;
+}

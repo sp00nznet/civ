@@ -64,6 +64,10 @@ void int_handler(CPU *cpu, uint8_t num);  /* Generic interrupt */
 /* Port I/O dispatch */
 void port_out8(CPU *cpu, uint16_t port, uint8_t value);
 uint8_t port_in8(CPU *cpu, uint16_t port);
+/* Word port I/O. The 386 half of the decoder emits `in ax, dx` / `out dx, ax`;
+ * on the ISA bus that is two byte accesses, low half first. */
+void port_out16(CPU *cpu, uint16_t port, uint16_t value);
+uint16_t port_in16(CPU *cpu, uint16_t port);
 
 /* Get global DOS state (stored in CPU context) */
 DosState *get_dos_state(CPU *cpu);
